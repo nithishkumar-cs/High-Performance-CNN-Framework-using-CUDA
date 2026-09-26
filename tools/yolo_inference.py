@@ -21,6 +21,13 @@ PROVIDERS = {
 
 
 def make_session(model: Path, backend: str) -> Any:
+    if backend == 'tensorrt-native':
+        if __package__:
+            from .tensorrt_inference import TensorRTSession
+        else:
+            from tensorrt_inference import TensorRTSession
+        return TensorRTSession(model)
+
     import onnxruntime as ort
 
     requested = PROVIDERS[backend]
@@ -169,7 +176,7 @@ def main() -> int:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--format", choices=("v5", "v8"), required=True)
-    parser.add_argument("--backend", choices=("cpu", "cuda", "tensorrt"), default="cpu")
+    parser.add_argument("--backend", choices=("cpu", "cuda", "tensorrt", "tensorrt-native"), default="cpu")
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--confidence", type=float, default=0.25)
     parser.add_argument("--nms", type=float, default=0.45)

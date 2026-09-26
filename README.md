@@ -1,10 +1,68 @@
-# Jetson YOLO CUDA
+# Scratch YOLO detector for CUDA and Jetson
 
-This project evolved from a handwritten CUDA MNIST CNN into a 20-class
-Pascal VOC object detector. The earlier CNN sources remain recoverable in
-Git history. Detection training uses Ultralytics YOLOv8n; deployment runs
-decoded YOLO ONNX models with ONNX Runtime. A separate CUDA
-post-processing prototype lives in src/yolo_cuda.
+The primary project is an independently implemented, YOLOv3-tiny-inspired
+20-class detector in `scratch_yolo/`. It has its own two-scale network,
+anchor assignment, training objective, VOC loader, raw-head decoder, and
+inference command. It starts from random weights; it does not import
+Darknet or Ultralytics code or pretrained weights. Architecture and anchor
+ideas follow the [original YOLOv3 paper](https://pjreddie.com/static/papers/YOLOv3.pdf)
+and [Darknet tiny configuration](https://github.com/pjreddie/darknet/blob/master/cfg/yolov3-tiny.cfg).
+
+This is a working *training prototype*, not a finished custom-CUDA inference
+engine. The network currently runs through PyTorch CPU/CUDA operations. The
+loss is deliberately simplified and is not claimed to reproduce Darknet
+training exactly. A 416-pixel GPU smoke run, raw-head ONNX export with
+numerical parity, and Jetson CPU ONNX/native TensorRT smoke tests passed.
+The two TensorRT raw heads matched ONNX CPU within 0.00009 maximum absolute
+error on one smoke image. The *trained* model has since been measured on the
+Jetson: 70.75 ms ONNX CPU and 14.99 ms native TensorRT FP16 mean end-to-end
+on one image. Native custom-CUDA network kernels remain unimplemented.
+The completed 30-epoch run selected epoch 30 by validation AP and measured
+0.0433 AP@0.5 on the held-out VOC 2007 test set; the pretrained YOLOv8n
+comparison measured 0.7569 with the same evaluator. This scratch recipe is
+not yet accurate enough for practical detection. See
+`docs/scratch-yolo-training.md` for exact settings and limitations.
+See `docs/scratch-yolo-jetson.md` for the trained-model timing and parity record.
+
+## Train the primary detector
+
+Prepare the official VOC 2007 trainval/test archives using the baseline-neutral
+`tools/prepare_voc2007.py` script below. Then use a CUDA-enabled PyTorch
+environment with NumPy and Pillow:
+
+~~~bash
+python -m tools.train_scratch_yolo --epochs 30 --side 416 --batch 16
+python -m tools.train_scratch_yolo --epochs 30 --side 416 --batch 16 --resume
+python -m tools.evaluate_scratch_yolo --weights runs/scratch_yolo/selected.pt
+python -m tools.evaluate_ultralytics_common --weights runs/voc2007/yolov8n/weights/best.pt
+python -m tools.predict_scratch_yolo --weights runs/scratch_yolo/selected.pt --image data/voc2007/yolo/images/test/000001.jpg
+python -m tools.export_scratch_yolo --weights runs/scratch_yolo/selected.pt --output runs/scratch_yolo/selected.onnx
+python -m tools.benchmark_scratch_jetson --model runs/scratch_yolo/selected.onnx --image data/voc2007/yolo/images/test/000001.jpg --backend cpu
+python -m unittest discover -s tests -p test_scratch_yolo.py
+~~~
+
+Training saves `best.pt` by validation loss, `last.pt`, periodic epoch
+checkpoints for validation-AP selection, and `summary.json`. Select
+`selected.pt` using the full-validation steps in `docs/scratch-yolo.md`
+before running the held-out test command above.
+These artifacts are ignored by Git. `--limit-train` and `--limit-val` are
+smoke-test options; checkpoints made with either flag are not trained models.
+TensorRT is **optional**, not required to train or evaluate the detector.
+The ONNX export has two *raw* heads, so it is not compatible with the older
+YOLOv8 ONNX runner. Use `benchmark_scratch_jetson.py` for it. A Jetson-built
+FP16 TensorRT engine can be passed with `--backend tensorrt-native`; this
+deployment path still needs trained-model validation. See
+`docs/scratch-yolo.md` for architecture, evaluation protocol, and limits.
+
+## Ultralytics YOLOv8n comparison baseline
+
+The earlier, published work fine-tuned pretrained Ultralytics YOLOv8n on the
+same fixed VOC split. Its training, ONNX runner, and Jetson TensorRT results
+remain here for comparison only. They are **not** results of `scratch_yolo/`.
+YOLOv8n and YOLOv3-tiny are different architectures; a fair performance
+comparison needs the same test split, input size, evaluation implementation,
+Jetson power mode, and full-pipeline timing. The older MNIST CNN and unrelated
+post-processing prototype are recoverable in Git history, not this working tree.
 
 ## Status and scope
 
@@ -12,12 +70,11 @@ post-processing prototype lives in src/yolo_cuda.
   YOLO label validation, and same-process latency benchmarking.
 - Optional: CUDA and TensorRT execution through ONNX Runtime when the installed
   runtime exposes those providers. CPU is available as a reference backend.
-- Prototype: CUDA candidate decoding in src/yolo_cuda. It is a standalone
-  component, not wired into the ONNX runner and not a complete YOLO network.
 - Training: VOC 2007 conversion, fine-tuning, and held-out test evaluation
   through tools/prepare_voc2007.py and tools/train_voc2007.py.
-- Pending device work: Jetson model validation, power sampling, and measured
-  CPU/CUDA/TensorRT comparisons.
+- Measured on Jetson Orin Nano Super: ONNX Runtime CPU and native TensorRT FP16
+  full-detector timing, plus model-only TensorRT timing and board-input power.
+  ONNX Runtime CUDA/TensorRT provider tests are still pending.
 
 No model weights or dataset are bundled. A trained ONNX model and test image
 are needed for inference or performance measurements.
@@ -63,6 +120,15 @@ mAP@0.5:0.95 on the held-out 2007 test set. See
 docs/voc2007-training.md for the exact split, settings, per-class scores,
 artifact checksums, and local CPU baseline.
 
+## Jetson measurements
+
+On a Jetson Orin Nano Super in 25W mode, the warmed CPU ONNX detector measured
+62.27 ms mean end-to-end (16.06 FPS) on one held-out image. The native TensorRT
+FP16 detector measured 16.17 ms end-to-end (61.83 FPS) on that image. TensorRT's
+separate model-only `trtexec` test measured 2.86 ms host latency and 375
+inferences/s; that is not full-detector FPS. See docs/jetson-benchmark.md for
+methodology, commands, power samples, and limitations. TensorRT is optional.
+
 ## Supported ONNX outputs
 
 The model must produce one decoded, non-NMS output tensor. Coordinates are
@@ -80,9 +146,11 @@ not yet supported.
 ## Set up and run
 
 For a CPU smoke test, install the dependencies in requirements-cpu.txt.
-On Jetson, install an ONNX Runtime build compatible with its JetPack/CUDA
-stack that exposes CUDAExecutionProvider or TensorrtExecutionProvider.
-The runner fails clearly if the requested provider is unavailable.
+On Jetson, the CPU path needs ONNX Runtime. The CUDA and TensorRT backends in
+this runner require a compatible ONNX Runtime GPU build exposing those
+providers; the runner fails clearly if one is unavailable. Native TensorRT
+uses `--backend tensorrt-native` with a device-built `.engine` file and the
+installed TensorRT Python bindings. See docs/jetson-benchmark.md for setup.
 
 ~~~bash
 python -m pip install -r requirements-cpu.txt
@@ -108,20 +176,6 @@ The classes file contains one name per line.
 ~~~bash
 python tools/validate_yolo_dataset.py path/to/dataset --classes path/to/classes.txt
 ~~~
-
-## CUDA prototype
-
-The CUDA component decodes independent candidate logits and runs CPU NMS.
-It is useful for testing kernel behavior, but its input contract is not the
-same as the supported ONNX outputs above.
-
-~~~bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=87
-cmake --build build -j
-./build/yolo_postprocess_demo
-~~~
-
-Set CMAKE_CUDA_ARCHITECTURES to the target GPU architecture.
 
 ## Background
 

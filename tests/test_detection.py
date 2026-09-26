@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,15 @@ from tools.yolo_inference import decode, letterbox
 
 
 class DetectorTests(unittest.TestCase):
+    def test_native_tensorrt_backend_dispatch(self):
+        from tools.yolo_inference import make_session
+
+        marker = object()
+        with patch('tools.tensorrt_inference.TensorRTSession', return_value=marker) as session:
+            result = make_session(Path('model.engine'), 'tensorrt-native')
+        self.assertIs(result, marker)
+        session.assert_called_once_with(Path('model.engine'))
+
     def test_v5_suppresses_same_class_only(self):
         output = np.array([[
             [50, 50, 40, 40, .9, .9, .1],

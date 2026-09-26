@@ -44,7 +44,7 @@ def main() -> int:
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--format", choices=("v5", "v8"), required=True)
-    parser.add_argument("--backend", choices=("cpu", "cuda", "tensorrt"), default="cpu")
+    parser.add_argument("--backend", choices=("cpu", "cuda", "tensorrt", "tensorrt-native"), default="cpu")
     parser.add_argument("--size", type=int, default=640)
     parser.add_argument("--runs", type=int, default=100)
     parser.add_argument("--warmup", type=int, default=10)

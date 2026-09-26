@@ -86,8 +86,10 @@ Local artifacts, excluded from Git:
 | Test metrics | runs/voc2007/yolov8n/summary.json | — |
 | CPU benchmark | runs/voc2007/yolov8n/cpu_benchmark.json | — |
 
-Jetson CPU/CUDA/TensorRT measurements and power sampling remain to be
-performed on the target device. TensorRT is optional for deployment.
+Jetson CPU and native TensorRT measurements were subsequently completed for
+this **Ultralytics YOLOv8n baseline**; see [jetson-benchmark.md](jetson-benchmark.md).
+They are not measurements of the independent scratch detector. TensorRT is
+optional for deployment.
 
 Ultralytics supplies the training package and pretrained weights. Its
 [published license page](https://www.ultralytics.com/license) states that

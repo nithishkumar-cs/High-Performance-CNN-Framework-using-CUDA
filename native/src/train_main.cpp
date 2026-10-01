@@ -25,6 +25,7 @@ struct Options {
     std::vector<int> steps;
     std::vector<float> scales;
     float flip_probability = 0.0f;
+    float exposure_jitter = 0.0f;  // max relative brightness deviation, e.g. 0.3 => factor in [0.7, 1.3]
 };
 
 std::vector<int> int_list(const std::string& value) {
@@ -60,6 +61,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--steps") options.steps = int_list(value);
         else if (key == "--scales") options.scales = float_list(value);
         else if (key == "--flip-probability") options.flip_probability = std::stof(value);
+        else if (key == "--exposure-jitter") options.exposure_jitter = std::stof(value);
         else throw std::runtime_error("unknown option: " + key);
     }
     if (options.epochs < 1 || options.epochs > 100000 || options.limit < 0)
@@ -69,7 +71,15 @@ Options options_from(int argc, char** argv) {
         throw std::runtime_error("--steps and --scales must have the same length");
     if (!(options.flip_probability >= 0.0f && options.flip_probability <= 1.0f))
         throw std::runtime_error("invalid flip probability");
+    if (!(options.exposure_jitter >= 0.0f && options.exposure_jitter < 1.0f))
+        throw std::runtime_error("invalid exposure jitter");
     return options;
+}
+
+// Scales every channel by a factor in [1 - jitter, 1 + jitter], clamped to the valid [0,1] pixel
+// range; approximates Darknet's exposure augmentation without a full HSV round trip.
+void jitter_exposure(std::vector<float>& chw, float factor) {
+    for (auto& value : chw) value = std::clamp(value * factor, 0.0f, 1.0f);
 }
 
 // Mirrors the letterboxed CHW buffer left-right in place (one row-reverse per channel/row).
@@ -128,7 +138,7 @@ int main(int argc, char** argv) {
             std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
                          "[--init weights] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
-                         "[--flip-probability 0.0]\n";
+                         "[--flip-probability 0.0] [--exposure-jitter 0.0]\n";
             return 2;
         }
         auto options = options_from(argc, argv);
@@ -145,9 +155,11 @@ int main(int argc, char** argv) {
         fs::path labels_dir = argv[3];
         std::mt19937 rng(options.seed);
         std::bernoulli_distribution flip_coin(options.flip_probability);
+        std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
         std::cout << "training_backend=cpu images=" << images.size() << " epochs=" << options.epochs
                   << " batch=" << options.batch_size << " frozen_batchnorm=0"
-                  << " flip_probability=" << options.flip_probability << "\n";
+                  << " flip_probability=" << options.flip_probability
+                  << " exposure_jitter=" << options.exposure_jitter << "\n";
         for (int epoch = 1; epoch <= options.epochs; ++epoch) {
             std::shuffle(images.begin(), images.end(), rng);
             double loss_sum = 0;
@@ -160,6 +172,7 @@ int main(int argc, char** argv) {
                     flip_horizontal(box.chw, network.input_shape());
                     for (auto& label : labels) label.cx = 1.0f - label.cx;
                 }
+                if (options.exposure_jitter > 0.0f) jitter_exposure(box.chw, exposure_dist(rng));
                 auto result = trainer.step(box.chw, labels);
                 loss_sum += result.loss;
                 positives += result.positives;

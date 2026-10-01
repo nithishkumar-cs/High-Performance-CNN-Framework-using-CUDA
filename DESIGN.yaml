@@ -1,0 +1,57 @@
+project:
+  purpose: Independently written, reusable C++/CUDA neural-network framework inspired by Darknet, supporting configurable training and inference across models, with Jetson inference as a deployment target.
+  current_state: The worktree contains an untracked CMake-based native C++/CUDA framework plus the restored original CUDA CNN. Native CPU/CUDA inference and single-sample classifier SGD work; YOLOv3-tiny is an inference/evaluation workload. A useful VOC2007 checkpoint came from external original Darknet training on Jetson before the laptop-only decision; native detector training remains experimental and has not produced a useful model. Laptop Docker training is documented but its image build and GPU run are unverified. Git is still mid-revert of be906e4 with conflicts resolved and staged, and main is one commit ahead of origin/main; the native framework, docs, CMakeLists.txt and this design are not tracked yet.
+
+requirements:
+  - requirement: Build on the user's original CUDA CNN repository and keep its Git history; implement a trainable multi-model framework, not only a YOLOv3-tiny application.
+  - requirement: Train future models on this laptop's RTX 3070 Ti; use the Jetson Orin for inference and evaluation only. The older Jetson-trained checkpoint remains a historical baseline.
+  - requirement: Implement the framework independently without forking or copying Darknet source. Compatibility is limited to the supported config layers and Darknet-format weights; unsupported layers fail explicitly.
+  - requirement: Preserve native CPU/CUDA inference and Jetson deployment. ONNX export and TensorRT inference are optional paths for the same trained weights, not prerequisites for native inference.
+  - requirement: Evaluate comparable models and report dataset, checkpoint origin, metric definition and timing scope. The VOC AP@0.5 values use converted labels without difficult objects and are not official VOC or COCO leaderboard scores.
+  - requirement: Run long jobs without opening visible extra terminals.
+banned:
+  - item: Treat YOLOv3-tiny inference or weights trained by original Darknet as proof that this framework can train a useful detector.
+    reason: The user asked for a trainable C/CUDA framework; native detector training has not achieved that result.
+  - item: Use Jetson for future training runs.
+    reason: The user chose laptop-only training and Jetson-only inference.
+  - item: Reintroduce unrelated PyTorch/Ultralytics implementation as the project core or compare YOLOv8n as if it were the same Darknet model.
+    reason: The user corrected that scope; Ultralytics may be used only for a genuinely comparable baseline.
+  - item: Fabricate, backdate, or auto-generate (e.g. via an activity-generator tool) commit dates/history to make the work look older or predate this assistance.
+    reason: The user asked for spread-out weekend-dated commits going back a year; the assistant refused and the user accepted an honest history going forward instead (commits may still note a genuine, evidence-backed approximate prior timeline in prose, not in commit dates).
+architecture:
+  - component: Git remote and Jetson deployment environment
+    responsibility: Source control for this repo and the remote target used for inference/deployment benchmarking (never training).
+    contracts: "GitHub origin `nithishkumar-cs/High-Performance-CNN-Framework-using-CUDA`, commits authored as `Nithish Kumar <nithishk.cs@gmail.com>`; pushes to `main` need the user's explicit approval each time (sandbox auto-review blocks unapproved pushes). Jetson reachable via SSH alias `jetson-ts` (also `jetson`): a Jetson Orin Nano Super on JetPack R36.5 with TensorRT 10.3; benchmarks default to the board's 25W mode unless stated otherwise."
+  - component: Root CMakeLists.txt, original CUDA CNN, and native CLI programs
+    responsibility: Build the newer detector_core C++17 library and detector/classifier inspect, train, evaluate and benchmark executables while retaining the original fixed-shape MNIST CUDA CNN as project history.
+    contracts: CMake options DETECTOR_CUDA, DETECTOR_OPENCV and DETECTOR_TENSORRT select optional backends; TensorRT requires CUDA. The restored original CNN files are currently staged by an unfinished revert, while CMakeLists.txt and native/ are untracked in the worktree.
+  - component: native/src/network.cpp and native/src/cuda_backend.cu
+    responsibility: Config-driven graph and CPU/CUDA inference for convolution, max-pooling, dense, route, upsample, YOLO heads and terminal softmax; load/save supported Darknet-format weights.
+    contracts: The graph supports YOLOv3-tiny inference but not arbitrary Darknet configs or full YOLOv3/Darknet-53; shortcut (residual) layers are the specific missing layer type that blocks those, plus dropout, reorg and RNN-family layers from upstream Darknet are unimplemented.
+  - component: native/src/classifier_trainer.cpp and native/src/cuda_classifier_trainer.cu
+    responsibility: CPU/CUDA single-sample SGD for sequential linear, MLP and small CNN classifiers with softmax/cross-entropy; IDX/MNIST CLI and examples.
+    contracts: CUDA trainer lacks branched-graph backprop and trainable batch normalization; full MNIST Jetson runs reached 97.24% test accuracy for the MLP and 97.27% for the small CNN.
+  - component: native/src/training.cpp
+    responsibility: Experimental CPU YOLO trainer with simplified loss and batch size one.
+    contracts: A 64x64 VOC pilot reached only 0.00113 validation mAP@0.5; it did not train YOLOv3-tiny or a useful detector.
+  - component: native/tools and native/docker
+    responsibility: Convert VOC2007, prepare an external original-Darknet training run, monitor checkpoints, and export the selected Darknet weights to ONNX.
+    contracts: The historical 10,000-batch Jetson-trained YOLOv3-tiny checkpoint reached 0.57379 validation and 0.55534 test mAP@0.5; source, data, weights and run artifacts stay outside Git. Future training is on the laptop.
+  - component: native/src/trt_session.cpp and native Jetson evaluator
+    responsibility: Optional ONNX/TensorRT FP32 or FP16 deployment using the shared YOLO decoder and evaluator.
+    contracts: On the historical checkpoint, Jetson FP16 reached 0.55595 test mAP@0.5 and 11.970 ms in-memory pipeline mean versus 100.786 ms for native CUDA; engines are built on Jetson and are not portable.
+  - component: native/tests and CTest
+    responsibility: Smoke checks for graph inference, detector training, metrics, classifier training, IDX handling and CLI/data/export helpers.
+    contracts: CMake registers native C++ tests and Python helper tests; CUDA classifier CLI tests require DETECTOR_CUDA, and the ONNX export test requires numpy, onnx and onnxruntime. Historical test results in docs are not a fresh validation of this untracked worktree.
+todo:
+  - item: "[req-8] ok what is next step? what is there in the darknet repo i shared that we don't have (open request; full text: lean req show 8)"
+  - item: "[req-7] we are way past that, analyze the codebase to understand what we are doing and update the design doc (open request; full text: lean req show 7)"
+  - item: "[req-6] try now (open request; full text: lean req show 6)"
+  - item: "[req-5] now? (open request; full text: lean req show 5)"
+  - item: "[req-4] ran the shell now what? what else is left in to do? did we solve over pinging issues by codex orchestrator? (open request; full text: lean req show 4)"
+  - item: "[req-1] we will do the training only in this laptop and inference on jetson, do the next stuff (open request; full text: lean req show 1)"
+  - item: Settle the already conflict-resolved, staged `git revert be906e4` and then commit the untracked native framework, CMake build, docs and design as the intended project state. The staged revert removes the earlier PyTorch/ONNX tooling and restores the original CUDA CNN; current worktree docs/native source are separate and untracked. Do not let the revert commit accidentally include unrelated worktree files.
+  - item: Finish the laptop Docker image build, validate a GPU training preflight and full training run, select its checkpoint on validation data, then deploy only that artifact to Jetson for inference.
+  - item: If a YOLOv8n/Ultralytics comparison baseline is later published or distributed, resolve its AGPL-3.0 licensing first; this baseline is not part of the current native worktree.
+  - item: Extend native CUDA training to branched graphs (route, upsample and YOLO heads), trainable batch normalization, and a faithful YOLO target/loss pipeline; add minibatching, augmentation, optimization and schedule support needed for useful detector training.
+  - item: Keep MNIST classifier and YOLOv3-tiny evaluation baselines as regressions while expanding the framework beyond one detector architecture.

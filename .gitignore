@@ -1,24 +1,21 @@
-CNN.exe
-CNN
-yolo_postprocess_demo.exe
-build/
-out/
-*.o
-*.obj
-*.lib
-*.exp
-*.pdb
+# Local datasets, checkpoints, and measurements are never versioned.
+/data/
+/runs/
 *.pt
+*.weights
 *.onnx
 *.engine
-*.trt
-*.log
-__pycache__/
-.pytest_cache/
-.venv/
-data/
-runs/
+
+# Native build products and local editor settings.
+/build/
+/cmake-build-*/
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
 .vscode/
-~$*
-benchmark.json
-detections.json
+
+# Remnants of earlier experiments may exist locally after the rollback.
+__pycache__/
+*.pyc

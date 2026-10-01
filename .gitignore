@@ -19,3 +19,4 @@
 # Remnants of earlier experiments may exist locally after the rollback.
 __pycache__/
 *.pyc
+.agent-work/

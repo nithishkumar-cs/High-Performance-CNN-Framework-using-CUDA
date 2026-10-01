@@ -27,7 +27,7 @@ architecture:
     contracts: CMake options DETECTOR_CUDA, DETECTOR_OPENCV and DETECTOR_TENSORRT select optional backends; TensorRT requires CUDA. The restored original CNN files are committed; CMakeLists.txt and native/ are still untracked in the worktree.
   - component: native/src/network.cpp and native/src/cuda_backend.cu
     responsibility: Config-driven graph and CPU/CUDA inference for convolution, max-pooling, dense, route, upsample, YOLO heads and terminal softmax; load/save supported Darknet-format weights.
-    contracts: The graph supports YOLOv3-tiny inference but not arbitrary Darknet configs or full YOLOv3/Darknet-53; shortcut (residual) layers are the specific missing layer type that blocks those, plus dropout, reorg and RNN-family layers from upstream Darknet are unimplemented.
+    contracts: The graph supports YOLOv3-tiny inference plus shortcut (residual-add) layers for CPU and CUDA (2026-10-01, `native/tests/shortcut.cfg` regression test), which is the layer needed to parse full YOLOv3/Darknet-53 configs; those full configs are still unvalidated end-to-end. Dropout, reorg and RNN-family layers from upstream Darknet remain unimplemented (low priority, not requested).
   - component: native/src/classifier_trainer.cpp and native/src/cuda_classifier_trainer.cu
     responsibility: CPU/CUDA single-sample SGD for sequential linear, MLP and small CNN classifiers with softmax/cross-entropy; IDX/MNIST CLI and examples.
     contracts: CUDA trainer lacks branched-graph backprop and trainable batch normalization; full MNIST Jetson runs reached 97.24% test accuracy for the MLP and 97.27% for the small CNN.
@@ -44,6 +44,8 @@ architecture:
     responsibility: Smoke checks for graph inference, detector training, metrics, classifier training, IDX handling and CLI/data/export helpers.
     contracts: CMake registers native C++ tests and Python helper tests; CUDA classifier CLI tests require DETECTOR_CUDA, and the ONNX export test requires numpy, onnx and onnxruntime. Historical test results in docs are not a fresh validation of this untracked worktree.
 todo:
+  - item: "[req-9] ok do all except the low priority - A faithful YOLO training loss/anchor-target assignment pipeline, data augmentation, LR schedule/burn-in, and multi-GPU train… (open request; full text: lean req show 9)"
+  - item: "[req-8] ok what is next step? what is there in the darknet repo i shared that we don't have (open request; full text: lean req show 8)"
   - item: "[req-6] try now (open request; full text: lean req show 6)"
   - item: "[req-5] now? (open request; full text: lean req show 5)"
   - item: "[req-4] ran the shell now what? what else is left in to do? did we solve over pinging issues by codex orchestrator? (open request; full text: lean req show 4)"
@@ -51,5 +53,5 @@ todo:
   - item: Next step (answers req-8) - commit the untracked native framework, CMake build and docs as the intended project state now that the revert is settled, then finish the laptop Docker training validation below.
   - item: Finish the laptop Docker image build, validate a GPU training preflight and full training run, select its checkpoint on validation data, then deploy only that artifact to Jetson for inference.
   - item: If a YOLOv8n/Ultralytics comparison baseline is later published or distributed, resolve its AGPL-3.0 licensing first; this baseline is not part of the current native worktree.
-  - item: Extend native CUDA training to branched graphs (route, upsample and YOLO heads), trainable batch normalization, and a faithful YOLO target/loss pipeline; add minibatching, augmentation, optimization and schedule support needed for useful detector training.
+  - item: "[req-9] In progress, user-requested (excludes low-priority dropout/reorg/RNN layers): close the native-vs-Darknet training gap in phases - (1) done: shortcut/residual layers for CPU+CUDA inference. (2) trainable batch normalization (forward-only today; needs a backward pass through scale/variance). (3) branched-graph backprop and minibatching in the CPU/CUDA trainers (today: sequential graphs only, single-sample SGD). (4) a faithful YOLO training loss/anchor-target assignment pipeline, data augmentation, and LR schedule/burn-in (today: the experimental CPU YOLO trainer in native/src/training.cpp reached only 0.00113 val mAP@0.5 on a 64x64 VOC pilot - it has never trained a useful detector). Each phase is a large, separate, carefully-validated unit of work; do not attempt (2)-(4) in one pass without dedicated test coverage per phase."
   - item: Keep MNIST classifier and YOLOv3-tiny evaluation baselines as regressions while expanding the framework beyond one detector architecture.

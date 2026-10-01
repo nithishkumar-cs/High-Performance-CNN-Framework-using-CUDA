@@ -61,6 +61,9 @@ public:
     void save_weights(const std::string& path) const;
     Shape input_shape() const { return input_; }
     const std::vector<Layer>& layers() const { return layers_; }
+    // Mutable single-layer access for tests that perturb a trained parameter directly
+    // (e.g. a finite-difference gradient check against Trainer's analytic backward).
+    Layer& layer(std::size_t index) { return layers_.at(index); }
     std::vector<Head> forward(const std::vector<float>& input, Backend backend) const;
     std::vector<float> classify(const std::vector<float>& input, Backend backend) const;
     std::vector<Detection> detect(const std::vector<float>& input, Backend backend,

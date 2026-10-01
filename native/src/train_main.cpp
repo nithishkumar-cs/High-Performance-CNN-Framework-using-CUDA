@@ -1,0 +1,177 @@
+#include "detector/image.hpp"
+#include "detector/trainer.hpp"
+#include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+
+namespace fs = std::filesystem;
+
+namespace {
+
+struct Options {
+    int epochs = 1;
+    int limit = 0;
+    float learning_rate = 0.0001f;
+    float decay = 0.0005f;
+    std::uint32_t seed = 2026;
+    std::string initial_weights;
+    int batch_size = 1;
+    int burn_in = 0;
+    std::vector<int> steps;
+    std::vector<float> scales;
+    float flip_probability = 0.0f;
+};
+
+std::vector<int> int_list(const std::string& value) {
+    std::vector<int> result;
+    std::istringstream stream(value);
+    std::string field;
+    while (std::getline(stream, field, ',')) if (!field.empty()) result.push_back(std::stoi(field));
+    return result;
+}
+
+std::vector<float> float_list(const std::string& value) {
+    std::vector<float> result;
+    std::istringstream stream(value);
+    std::string field;
+    while (std::getline(stream, field, ',')) if (!field.empty()) result.push_back(std::stof(field));
+    return result;
+}
+
+Options options_from(int argc, char** argv) {
+    Options options;
+    for (int i = 5; i < argc; i += 2) {
+        if (i + 1 >= argc) throw std::runtime_error("option requires a value");
+        std::string key = argv[i];
+        std::string value = argv[i + 1];
+        if (key == "--epochs") options.epochs = std::stoi(value);
+        else if (key == "--limit") options.limit = std::stoi(value);
+        else if (key == "--lr") options.learning_rate = std::stof(value);
+        else if (key == "--decay") options.decay = std::stof(value);
+        else if (key == "--seed") options.seed = static_cast<std::uint32_t>(std::stoul(value));
+        else if (key == "--init") options.initial_weights = value;
+        else if (key == "--batch") options.batch_size = std::stoi(value);
+        else if (key == "--burn-in") options.burn_in = std::stoi(value);
+        else if (key == "--steps") options.steps = int_list(value);
+        else if (key == "--scales") options.scales = float_list(value);
+        else if (key == "--flip-probability") options.flip_probability = std::stof(value);
+        else throw std::runtime_error("unknown option: " + key);
+    }
+    if (options.epochs < 1 || options.epochs > 100000 || options.limit < 0)
+        throw std::runtime_error("invalid epochs or limit");
+    if (options.batch_size < 1) throw std::runtime_error("invalid batch size");
+    if (options.steps.size() != options.scales.size())
+        throw std::runtime_error("--steps and --scales must have the same length");
+    if (!(options.flip_probability >= 0.0f && options.flip_probability <= 1.0f))
+        throw std::runtime_error("invalid flip probability");
+    return options;
+}
+
+// Mirrors the letterboxed CHW buffer left-right in place (one row-reverse per channel/row).
+void flip_horizontal(std::vector<float>& chw, const detector::Shape& shape) {
+    for (int c = 0; c < shape.c; ++c)
+        for (int y = 0; y < shape.h; ++y) {
+            auto* row = chw.data() + (static_cast<std::size_t>(c) * shape.h + y) * shape.w;
+            std::reverse(row, row + shape.w);
+        }
+}
+
+std::vector<detector::Target> labels_from(const fs::path& path, const detector::Letterbox& box,
+                                           detector::Shape network_shape) {
+    std::ifstream file(path);
+    if (!file) throw std::runtime_error("missing label file: " + path.string());
+    std::vector<detector::Target> targets;
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.empty()) continue;
+        std::istringstream stream(line);
+        detector::Target target;
+        std::string extra;
+        if (!(stream >> target.class_id >> target.cx >> target.cy >> target.width >> target.height) || (stream >> extra))
+            throw std::runtime_error("malformed YOLO label in " + path.string());
+        // Convert boxes from original-image normalization to network letterbox normalization.
+        target.cx = (target.cx * box.resized_width + box.left) / network_shape.w;
+        target.cy = (target.cy * box.resized_height + box.top) / network_shape.h;
+        target.width *= static_cast<float>(box.resized_width) / network_shape.w;
+        target.height *= static_cast<float>(box.resized_height) / network_shape.h;
+        targets.push_back(target);
+    }
+    return targets;
+}
+
+std::vector<fs::path> images_from(const fs::path& directory) {
+    if (!fs::is_directory(directory)) throw std::runtime_error("not an image directory: " + directory.string());
+    std::vector<fs::path> images;
+    for (const auto& item : fs::directory_iterator(directory)) {
+        if (!item.is_regular_file()) continue;
+        std::string extension = item.path().extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (extension == ".ppm" || extension == ".jpg" || extension == ".jpeg" || extension == ".png")
+            images.push_back(item.path());
+    }
+    std::sort(images.begin(), images.end());
+    if (images.empty()) throw std::runtime_error("no images found in " + directory.string());
+    return images;
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    try {
+        if (argc < 5) {
+            std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
+                         "[--init weights] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
+                         "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
+                         "[--flip-probability 0.0]\n";
+            return 2;
+        }
+        auto options = options_from(argc, argv);
+        fs::path output_path = argv[4];
+        if (fs::exists(output_path)) throw std::runtime_error("refusing to overwrite existing output: " + output_path.string());
+        auto network = detector::Network::from_cfg(argv[1]);
+        if (options.initial_weights.empty()) network.initialize_random(options.seed);
+        else network.load_weights(options.initial_weights);
+        detector::LearningRateSchedule schedule{options.learning_rate, options.burn_in, 4.0f,
+                                                 options.steps, options.scales};
+        detector::Trainer trainer(network, schedule, options.batch_size, options.decay);
+        auto images = images_from(argv[2]);
+        if (options.limit > 0 && images.size() > static_cast<std::size_t>(options.limit)) images.resize(options.limit);
+        fs::path labels_dir = argv[3];
+        std::mt19937 rng(options.seed);
+        std::bernoulli_distribution flip_coin(options.flip_probability);
+        std::cout << "training_backend=cpu images=" << images.size() << " epochs=" << options.epochs
+                  << " batch=" << options.batch_size << " frozen_batchnorm=0"
+                  << " flip_probability=" << options.flip_probability << "\n";
+        for (int epoch = 1; epoch <= options.epochs; ++epoch) {
+            std::shuffle(images.begin(), images.end(), rng);
+            double loss_sum = 0;
+            std::size_t positives = 0;
+            for (const auto& path : images) {
+                auto image = detector::read_image(path.string());
+                auto box = detector::letterbox(image, network.input_shape());
+                auto labels = labels_from(labels_dir / (path.stem().string() + ".txt"), box, network.input_shape());
+                if (flip_coin(rng)) {
+                    flip_horizontal(box.chw, network.input_shape());
+                    for (auto& label : labels) label.cx = 1.0f - label.cx;
+                }
+                auto result = trainer.step(box.chw, labels);
+                loss_sum += result.loss;
+                positives += result.positives;
+            }
+            network.save_weights(output_path.string());
+            std::cout << "epoch=" << epoch << " mean_loss=" << loss_sum / images.size()
+                      << " positives=" << positives << " lr=" << trainer.current_learning_rate()
+                      << " checkpoint=" << output_path.string() << '\n';
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << "error: " << error.what() << '\n';
+        return 1;
+    }
+}

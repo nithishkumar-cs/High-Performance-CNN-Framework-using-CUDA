@@ -45,7 +45,6 @@ architecture:
     contracts: CMake registers native C++ tests and Python helper tests; CUDA classifier CLI tests require DETECTOR_CUDA, and the ONNX export test requires numpy, onnx and onnxruntime. Historical test results in docs are not a fresh validation of this untracked worktree.
 todo:
   - item: "[req-9] ok do all except the low priority - A faithful YOLO training loss/anchor-target assignment pipeline, data augmentation, LR schedule/burn-in, and multi-GPU train… (open request; full text: lean req show 9)"
-  - item: "[req-8] ok what is next step? what is there in the darknet repo i shared that we don't have (open request; full text: lean req show 8)"
   - item: "[req-6] try now (open request; full text: lean req show 6)"
   - item: "[req-5] now? (open request; full text: lean req show 5)"
   - item: "[req-4] ran the shell now what? what else is left in to do? did we solve over pinging issues by codex orchestrator? (open request; full text: lean req show 4)"

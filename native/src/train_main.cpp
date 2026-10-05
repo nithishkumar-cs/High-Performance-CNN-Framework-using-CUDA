@@ -3,6 +3,7 @@
 #include "detector/trainer.hpp"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -26,7 +27,10 @@ struct Options {
     std::vector<int> steps;
     std::vector<float> scales;
     float flip_probability = 0.0f;
-    float exposure_jitter = 0.0f;  // max relative brightness deviation, e.g. 0.3 => factor in [0.7, 1.3]
+    float exposure_jitter = 0.0f;    // max relative brightness (HSV value) deviation, e.g. 0.3 => factor in [0.7, 1.3]
+    float saturation_jitter = 0.0f;  // max relative saturation deviation, same convention as exposure
+    float hue_jitter = 0.0f;         // max hue shift as a fraction of the full circle, e.g. 0.1 => +-36 degrees
+    float crop_jitter = 0.0f;        // max fraction of width/height cropped from each edge before letterboxing
     std::string backend = "cpu";
 };
 
@@ -64,6 +68,9 @@ Options options_from(int argc, char** argv) {
         else if (key == "--scales") options.scales = float_list(value);
         else if (key == "--flip-probability") options.flip_probability = std::stof(value);
         else if (key == "--exposure-jitter") options.exposure_jitter = std::stof(value);
+        else if (key == "--saturation-jitter") options.saturation_jitter = std::stof(value);
+        else if (key == "--hue-jitter") options.hue_jitter = std::stof(value);
+        else if (key == "--crop-jitter") options.crop_jitter = std::stof(value);
         else if (key == "--backend") options.backend = value;
         else throw std::runtime_error("unknown option: " + key);
     }
@@ -76,15 +83,97 @@ Options options_from(int argc, char** argv) {
         throw std::runtime_error("invalid flip probability");
     if (!(options.exposure_jitter >= 0.0f && options.exposure_jitter < 1.0f))
         throw std::runtime_error("invalid exposure jitter");
+    if (!(options.saturation_jitter >= 0.0f && options.saturation_jitter < 1.0f))
+        throw std::runtime_error("invalid saturation jitter");
+    if (!(options.hue_jitter >= 0.0f && options.hue_jitter <= 0.5f))
+        throw std::runtime_error("invalid hue jitter");
+    if (!(options.crop_jitter >= 0.0f && options.crop_jitter < 0.5f))
+        throw std::runtime_error("invalid crop jitter");
     if (options.backend != "cpu" && options.backend != "cuda")
         throw std::runtime_error("--backend must be cpu or cuda");
     return options;
 }
 
-// Scales every channel by a factor in [1 - jitter, 1 + jitter], clamped to the valid [0,1] pixel
-// range; approximates Darknet's exposure augmentation without a full HSV round trip.
-void jitter_exposure(std::vector<float>& chw, float factor) {
-    for (auto& value : chw) value = std::clamp(value * factor, 0.0f, 1.0f);
+// Converts one [0,1] RGB pixel to HSV (h,s,v each in [0,1]); h is undefined (set to 0) for gray pixels.
+void rgb_to_hsv(float r, float g, float b, float& h, float& s, float& v) {
+    float max_c = std::max({r, g, b}), min_c = std::min({r, g, b}), delta = max_c - min_c;
+    v = max_c;
+    s = max_c > 0.0f ? delta / max_c : 0.0f;
+    if (delta < 1e-8f) { h = 0.0f; return; }
+    if (max_c == r) h = std::fmod((g - b) / delta, 6.0f);
+    else if (max_c == g) h = (b - r) / delta + 2.0f;
+    else h = (r - g) / delta + 4.0f;
+    h /= 6.0f;
+    if (h < 0.0f) h += 1.0f;
+}
+
+// Inverse of rgb_to_hsv: converts HSV (h,s,v in [0,1], h wrapped) back to [0,1] RGB.
+void hsv_to_rgb(float h, float s, float v, float& r, float& g, float& b) {
+    float hh = h * 6.0f;
+    int i = ((static_cast<int>(std::floor(hh)) % 6) + 6) % 6;
+    float f = hh - std::floor(hh);
+    float p = v * (1 - s), q = v * (1 - s * f), t = v * (1 - s * (1 - f));
+    switch (i) {
+        case 0: r = v; g = t; b = p; break;
+        case 1: r = q; g = v; b = p; break;
+        case 2: r = p; g = v; b = t; break;
+        case 3: r = p; g = q; b = v; break;
+        case 4: r = t; g = p; b = v; break;
+        default: r = v; g = p; b = q; break;
+    }
+}
+
+// Jitters hue (circular shift), saturation and value (brightness) in HSV space, approximating
+// Darknet's hue/saturation/exposure augmentation triple; identity when all deltas are zero.
+void jitter_hsv(std::vector<float>& chw, const detector::Shape& shape, float hue_delta,
+                float saturation_factor, float value_factor) {
+    int area = shape.h * shape.w;
+    for (int p = 0; p < area; ++p) {
+        float h, s, v;
+        rgb_to_hsv(chw[p], chw[area + p], chw[2 * area + p], h, s, v);
+        h += hue_delta;
+        h -= std::floor(h);
+        s = std::clamp(s * saturation_factor, 0.0f, 1.0f);
+        v = std::clamp(v * value_factor, 0.0f, 1.0f);
+        float r, g, b;
+        hsv_to_rgb(h, s, v, r, g, b);
+        chw[p] = std::clamp(r, 0.0f, 1.0f);
+        chw[area + p] = std::clamp(g, 0.0f, 1.0f);
+        chw[2 * area + p] = std::clamp(b, 0.0f, 1.0f);
+    }
+}
+
+// Picks a random crop rectangle within [0,width)x[0,height), shrinking each edge by up to
+// `jitter` times that dimension (Darknet's "jitter" aspect/scale augmentation, crop-only variant).
+struct CropRect { int x0, y0, w, h; };
+CropRect random_crop_rect(int width, int height, float jitter, std::mt19937& rng) {
+    std::uniform_real_distribution<float> frac(0.0f, jitter);
+    int left = static_cast<int>(frac(rng) * width), right = static_cast<int>(frac(rng) * width);
+    int top = static_cast<int>(frac(rng) * height), bottom = static_cast<int>(frac(rng) * height);
+    int w = std::max(1, width - left - right), h = std::max(1, height - top - bottom);
+    left = std::min(left, width - w);
+    top = std::min(top, height - h);
+    return {left, top, w, h};
+}
+
+// Remaps a target's box (normalized to the pre-crop image) into crop-relative normalization,
+// clipping to the crop's bounds; returns false (leaving `target` unspecified) if the box's
+// center falls outside the crop, i.e. the object was cropped out.
+bool crop_target(detector::Target& target, const CropRect& crop, int orig_w, int orig_h) {
+    float x1 = (target.cx - target.width / 2) * orig_w, x2 = (target.cx + target.width / 2) * orig_w;
+    float y1 = (target.cy - target.height / 2) * orig_h, y2 = (target.cy + target.height / 2) * orig_h;
+    x1 = std::clamp(x1, static_cast<float>(crop.x0), static_cast<float>(crop.x0 + crop.w));
+    x2 = std::clamp(x2, static_cast<float>(crop.x0), static_cast<float>(crop.x0 + crop.w));
+    y1 = std::clamp(y1, static_cast<float>(crop.y0), static_cast<float>(crop.y0 + crop.h));
+    y2 = std::clamp(y2, static_cast<float>(crop.y0), static_cast<float>(crop.y0 + crop.h));
+    if (x2 <= x1 || y2 <= y1) return false;
+    float cx = (x1 + x2) / 2 - crop.x0, cy = (y1 + y2) / 2 - crop.y0;
+    if (cx < 0 || cx > crop.w || cy < 0 || cy > crop.h) return false;
+    target.cx = cx / crop.w;
+    target.cy = cy / crop.h;
+    target.width = (x2 - x1) / crop.w;
+    target.height = (y2 - y1) / crop.h;
+    return true;
 }
 
 // Mirrors the letterboxed CHW buffer left-right in place (one row-reverse per channel/row).
@@ -96,8 +185,8 @@ void flip_horizontal(std::vector<float>& chw, const detector::Shape& shape) {
         }
 }
 
-std::vector<detector::Target> labels_from(const fs::path& path, const detector::Letterbox& box,
-                                           detector::Shape network_shape) {
+// Parses YOLO-format labels, normalized to whatever image they describe (before any crop/letterbox).
+std::vector<detector::Target> raw_labels_from(const fs::path& path) {
     std::ifstream file(path);
     if (!file) throw std::runtime_error("missing label file: " + path.string());
     std::vector<detector::Target> targets;
@@ -109,18 +198,21 @@ std::vector<detector::Target> labels_from(const fs::path& path, const detector::
         std::string extra;
         if (!(stream >> target.class_id >> target.cx >> target.cy >> target.width >> target.height) || (stream >> extra))
             throw std::runtime_error("malformed YOLO label in " + path.string());
-        // Convert boxes from original-image normalization to network letterbox normalization.
-        target.cx = (target.cx * box.resized_width + box.left) / network_shape.w;
-        target.cy = (target.cy * box.resized_height + box.top) / network_shape.h;
-        target.width *= static_cast<float>(box.resized_width) / network_shape.w;
-        target.height *= static_cast<float>(box.resized_height) / network_shape.h;
         targets.push_back(target);
     }
     return targets;
 }
 
-// Shared epoch loop for both Trainer (CPU) and CudaTrainer (GPU): same data pipeline
-// (letterbox, flip/exposure augmentation, labels), differing only in which trainer type steps
+// Converts a box normalized to the pre-letterbox image into network letterbox normalization.
+void letterbox_target(detector::Target& target, const detector::Letterbox& box, detector::Shape network_shape) {
+    target.cx = (target.cx * box.resized_width + box.left) / network_shape.w;
+    target.cy = (target.cy * box.resized_height + box.top) / network_shape.h;
+    target.width *= static_cast<float>(box.resized_width) / network_shape.w;
+    target.height *= static_cast<float>(box.resized_height) / network_shape.h;
+}
+
+// Shared epoch loop for both Trainer (CPU) and CudaTrainer (GPU): same data pipeline (random
+// crop, letterbox, flip/HSV augmentation, labels), differing only in which trainer type steps
 // and whether its device-resident weights need syncing back to `network` before each checkpoint.
 template <typename TrainerT>
 void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::path>& images,
@@ -128,19 +220,31 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
                 std::mt19937& rng, bool sync_before_checkpoint) {
     std::bernoulli_distribution flip_coin(options.flip_probability);
     std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
+    std::uniform_real_distribution<float> saturation_dist(1.0f - options.saturation_jitter, 1.0f + options.saturation_jitter);
+    std::uniform_real_distribution<float> hue_dist(-options.hue_jitter, options.hue_jitter);
     for (int epoch = 1; epoch <= options.epochs; ++epoch) {
         std::shuffle(images.begin(), images.end(), rng);
         double loss_sum = 0;
         std::size_t positives = 0;
         for (const auto& path : images) {
             auto image = detector::read_image(path.string());
+            auto labels = raw_labels_from(labels_dir / (path.stem().string() + ".txt"));
+            if (options.crop_jitter > 0.0f) {
+                int orig_w = image.width, orig_h = image.height;
+                auto rect = random_crop_rect(orig_w, orig_h, options.crop_jitter, rng);
+                image = detector::crop(image, rect.x0, rect.y0, rect.w, rect.h);
+                std::vector<detector::Target> kept;
+                for (auto label : labels) if (crop_target(label, rect, orig_w, orig_h)) kept.push_back(label);
+                labels = std::move(kept);
+            }
             auto box = detector::letterbox(image, network.input_shape());
-            auto labels = labels_from(labels_dir / (path.stem().string() + ".txt"), box, network.input_shape());
+            for (auto& label : labels) letterbox_target(label, box, network.input_shape());
             if (flip_coin(rng)) {
                 flip_horizontal(box.chw, network.input_shape());
                 for (auto& label : labels) label.cx = 1.0f - label.cx;
             }
-            if (options.exposure_jitter > 0.0f) jitter_exposure(box.chw, exposure_dist(rng));
+            if (options.exposure_jitter > 0.0f || options.saturation_jitter > 0.0f || options.hue_jitter > 0.0f)
+                jitter_hsv(box.chw, network.input_shape(), hue_dist(rng), saturation_dist(rng), exposure_dist(rng));
             auto result = trainer.step(box.chw, labels);
             loss_sum += result.loss;
             positives += result.positives;
@@ -177,7 +281,8 @@ int main(int argc, char** argv) {
             std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
                          "[--init weights] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
-                         "[--flip-probability 0.0] [--exposure-jitter 0.0] [--backend cpu|cuda]\n";
+                         "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
+                         "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda]\n";
             return 2;
         }
         auto options = options_from(argc, argv);
@@ -195,7 +300,10 @@ int main(int argc, char** argv) {
         std::cout << "training_backend=" << options.backend << " images=" << images.size()
                   << " epochs=" << options.epochs << " batch=" << options.batch_size << " frozen_batchnorm=0"
                   << " flip_probability=" << options.flip_probability
-                  << " exposure_jitter=" << options.exposure_jitter << "\n";
+                  << " exposure_jitter=" << options.exposure_jitter
+                  << " saturation_jitter=" << options.saturation_jitter
+                  << " hue_jitter=" << options.hue_jitter
+                  << " crop_jitter=" << options.crop_jitter << "\n";
         if (options.backend == "cuda") {
 #ifdef DETECTOR_HAS_CUDA
             detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay);

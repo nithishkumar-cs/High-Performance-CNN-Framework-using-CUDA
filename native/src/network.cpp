@@ -63,6 +63,16 @@ int integer(const Section& section, const std::string& key, const std::string& f
     return value;
 }
 
+float floating(const Section& section, const std::string& key, const std::string& fallback = {}) {
+    auto s = option(section, key, fallback);
+    std::size_t used = 0;
+    float value = 0;
+    try { value = std::stof(s, &used); }
+    catch (const std::exception&) { throw std::runtime_error("invalid float " + key); }
+    if (used != s.size()) throw std::runtime_error("invalid float " + key);
+    return value;
+}
+
 std::vector<int> list(const Section& section, const std::string& key) {
     std::vector<int> result;
     std::istringstream stream(option(section, key));
@@ -303,6 +313,9 @@ Network Network::from_cfg(const std::string& path) {
                 throw std::runtime_error("yolo mask references missing anchor");
             if (shape.c != static_cast<int>(layer.mask.size()) * (layer.classes + 5))
                 throw std::runtime_error("yolo channels must equal mask count * (classes + 5)");
+            layer.ignore_thresh = floating(section, "ignore_thresh", "0.7");
+            if (!(layer.ignore_thresh > 0.0f && layer.ignore_thresh <= 1.0f))
+                throw std::runtime_error("ignore_thresh must be in (0,1]");
             layer.output = shape;
         } else {
             throw std::runtime_error("unsupported layer [" + section.name + "] at line " + std::to_string(section.line));

@@ -16,6 +16,9 @@ struct YoloLossResult {
 // computes BCE objectness/offset/class loss and log-space width/height loss, adding dL/doutput
 // into `gradient[i]` for every yolo layer i (caller must size gradient[i] to
 // network.layers()[i].output.elements() and zero it first; non-yolo entries are untouched).
+// Negative (non-assigned) anchor/cell objectness is skipped when its decoded predicted box
+// already overlaps some target by >= that layer's ignore_thresh (cfg `[yolo]` field, default
+// 0.7): a near-miss Darknet convention keeps unpenalized rather than pushed to "background".
 // `output[i]` must hold that yolo layer's raw head values (any backend: CPU or CUDA). Both the
 // returned loss and every written gradient are normalized by max(1, targets.size()). Shared by
 // the CPU and CUDA trainers so both use identical target assignment and loss math.

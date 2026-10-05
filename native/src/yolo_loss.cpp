@@ -21,6 +21,16 @@ float anchor_iou(float aw, float ah, float bw, float bh) {
     return intersection / (aw * ah + bw * bh - intersection);
 }
 
+// Standard IoU of two centered boxes (same units for both), used by the ignore_thresh near-miss
+// check; unlike anchor_iou above this accounts for box position, not just width/height.
+float box_iou(float cx1, float cy1, float w1, float h1, float cx2, float cy2, float w2, float h2) {
+    float ix = std::max(0.0f, std::min(cx1 + w1 / 2, cx2 + w2 / 2) - std::max(cx1 - w1 / 2, cx2 - w2 / 2));
+    float iy = std::max(0.0f, std::min(cy1 + h1 / 2, cy2 + h2 / 2) - std::max(cy1 - h1 / 2, cy2 - h2 / 2));
+    float intersection = ix * iy;
+    float denom = w1 * h1 + w2 * h2 - intersection;
+    return denom > 0 ? intersection / denom : 0.0f;
+}
+
 struct Assignment {
     int anchor = 0;
     int cell = 0;
@@ -90,6 +100,23 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
         for (int anchor = 0; anchor < static_cast<int>(layer.mask.size()); ++anchor)
             for (int cell = 0; cell < area; ++cell) {
                 if (positive[static_cast<std::size_t>(anchor) * area + cell]) continue;
+                if (layer.ignore_thresh < 1.0f && !targets.empty()) {
+                    // Decode this (anchor, cell)'s predicted box (same math as network.cpp's
+                    // decode()) and skip the negative push if it already overlaps some ground
+                    // truth by >= ignore_thresh: it is a near-miss the model should keep refining,
+                    // not be told is definitely background (Darknet's ignore_thresh rule).
+                    int x = cell % layer.output.w, y = cell / layer.output.w;
+                    auto [aw, ah] = layer.anchors[static_cast<std::size_t>(layer.mask[static_cast<std::size_t>(anchor)])];
+                    float px = (sigmoid(output[index][pos(anchor, 0, cell)]) + x) * input.w / layer.output.w;
+                    float py = (sigmoid(output[index][pos(anchor, 1, cell)]) + y) * input.h / layer.output.h;
+                    float pw = std::exp(std::clamp(output[index][pos(anchor, 2, cell)], -20.0f, 20.0f)) * aw;
+                    float ph = std::exp(std::clamp(output[index][pos(anchor, 3, cell)], -20.0f, 20.0f)) * ah;
+                    float best = 0;
+                    for (const auto& target : targets)
+                        best = std::max(best, box_iou(px, py, pw, ph, target.cx * input.w, target.cy * input.h,
+                                                        target.width * input.w, target.height * input.h));
+                    if (best >= layer.ignore_thresh) continue;
+                }
                 auto p = pos(anchor, 4, cell);
                 loss += negative_weight * binary_cross_entropy(output[index][p], 0.0f);
                 gradient[index][p] += negative_weight * sigmoid(output[index][p]);

@@ -96,6 +96,9 @@ if(BUILD_TESTING)
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
           $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-conv.cfg --cuda)
     endif()
+    add_test(NAME detector_train_augmentation
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_detector_train_augmentation.py
+        $<TARGET_FILE:cuda_detector_train> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/mini.cfg)
     add_test(NAME voc2007_conversion
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_convert_voc2007.py)
     add_test(NAME darknet_voc_preparation

@@ -29,6 +29,9 @@ struct Layer {
     bool batch_normalize = false;
     bool leaky = false;
     int classes = 0;
+    float ignore_thresh = 1.0f;  // yolo layers only: skip objectness-negative loss for predicted
+                                  // boxes overlapping any ground truth by at least this IoU (Darknet's
+                                  // near-miss "ignore" rule); 1.0 (unreachable) disables it.
     std::vector<int> sources;
     std::vector<int> mask;
     std::vector<std::pair<float, float>> anchors;

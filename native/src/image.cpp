@@ -118,4 +118,19 @@ void undo_letterbox(std::vector<Detection>& boxes, const Letterbox& transform) {
     }
 }
 
+Image crop(const Image& image, int x0, int y0, int w, int h) {
+    if (w <= 0 || h <= 0 || x0 < 0 || y0 < 0 || x0 + w > image.width || y0 + h > image.height)
+        throw std::runtime_error("crop rectangle outside image bounds");
+    Image result;
+    result.width = w;
+    result.height = h;
+    result.rgb.resize(static_cast<std::size_t>(w) * h * 3);
+    for (int y = 0; y < h; ++y) {
+        const auto* src = image.rgb.data() + (static_cast<std::size_t>(y0 + y) * image.width + x0) * 3;
+        auto* dst = result.rgb.data() + static_cast<std::size_t>(y) * w * 3;
+        std::copy(src, src + static_cast<std::size_t>(w) * 3, dst);
+    }
+    return result;
+}
+
 }  // namespace detector

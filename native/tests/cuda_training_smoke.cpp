@@ -1,0 +1,121 @@
+#include "detector/cuda_trainer.hpp"
+#include "detector/trainer.hpp"
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <iostream>
+#include <stdexcept>
+
+#ifdef DETECTOR_HAS_CUDA
+#include <cuda_runtime.h>
+#endif
+
+namespace {
+
+void expect(bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+// Trains two freshly-initialized (same seed) copies of `cfg` for `steps` steps on the same
+// input/targets, one with the CPU Trainer and one with CudaTrainer, and asserts every learned
+// parameter (weights, biases, and for batch_normalize layers scales/means/variances) matches
+// within a tight tolerance. This is the correctness evidence for the new CUDA training kernels:
+// it cross-checks against the CPU path already validated by the finite-difference gradient
+// check in training_smoke.cpp, rather than re-deriving the batch-norm math a second time.
+void check_parity(const std::string& cfg, const std::vector<float>& input,
+                   const std::vector<detector::Target>& targets, int steps, int batch_size,
+                   const char* label) {
+    auto cpu_net = detector::Network::from_cfg(cfg);
+    cpu_net.initialize_random(17);
+    auto gpu_net = detector::Network::from_cfg(cfg);
+    gpu_net.initialize_random(17);
+
+    detector::Trainer cpu_trainer(cpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
+    detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
+
+    float cpu_loss = 0, gpu_loss = 0;
+    for (int i = 0; i < steps; ++i) {
+        cpu_loss = cpu_trainer.step(input, targets).loss;
+        gpu_loss = gpu_trainer.step(input, targets).loss;
+    }
+    gpu_trainer.sync_to_network();
+
+    std::cout << "cuda_training_parity " << label << " cpu_loss=" << cpu_loss << " gpu_loss=" << gpu_loss << '\n';
+    expect(std::abs(cpu_loss - gpu_loss) < 1e-2f * std::max(1.0f, std::abs(cpu_loss)), "CPU/GPU loss mismatch");
+
+    const auto& cpu_layers = cpu_net.layers();
+    const auto& gpu_layers = gpu_net.layers();
+    expect(cpu_layers.size() == gpu_layers.size(), "layer count mismatch");
+    for (std::size_t i = 0; i < cpu_layers.size(); ++i) {
+        const auto& a = cpu_layers[i];
+        const auto& b = gpu_layers[i];
+        auto close = [](float x, float y) { return std::abs(x - y) < 1e-2f * std::max(1.0f, std::abs(x)); };
+        expect(a.weights.size() == b.weights.size(), "weight count mismatch");
+        float max_diff = 0; std::size_t max_p = 0;
+        for (std::size_t p = 0; p < a.weights.size(); ++p) {
+            float d = std::abs(a.weights[p] - b.weights[p]);
+            if (d > max_diff) { max_diff = d; max_p = p; }
+            expect(close(a.weights[p], b.weights[p]), "weight mismatch");
+        }
+        if (!a.weights.empty())
+            std::cout << "  layer " << i << " bn=" << a.batch_normalize << " weights max_diff=" << max_diff
+                      << " at " << max_p << " cpu=" << a.weights[max_p] << " gpu=" << b.weights[max_p] << '\n';
+        expect(a.biases.size() == b.biases.size(), "bias count mismatch");
+        float bias_diff = 0;
+        for (std::size_t p = 0; p < a.biases.size(); ++p) {
+            bias_diff = std::max(bias_diff, std::abs(a.biases[p] - b.biases[p]));
+            expect(close(a.biases[p], b.biases[p]), "bias mismatch");
+        }
+        if (!a.biases.empty()) std::cout << "    bias max_diff=" << bias_diff << '\n';
+        if (a.batch_normalize) {
+            float scale_diff = 0, mean_diff = 0, var_diff = 0;
+            for (std::size_t p = 0; p < a.scales.size(); ++p) {
+                scale_diff = std::max(scale_diff, std::abs(a.scales[p] - b.scales[p]));
+                expect(close(a.scales[p], b.scales[p]), "scale mismatch");
+            }
+            for (std::size_t p = 0; p < a.means.size(); ++p) {
+                mean_diff = std::max(mean_diff, std::abs(a.means[p] - b.means[p]));
+                expect(close(a.means[p], b.means[p]), "mean mismatch");
+            }
+            for (std::size_t p = 0; p < a.variances.size(); ++p) {
+                var_diff = std::max(var_diff, std::abs(a.variances[p] - b.variances[p]));
+                expect(close(a.variances[p], b.variances[p]), "variance mismatch");
+            }
+            std::cout << "    scale_diff=" << scale_diff << " mean_diff=" << mean_diff << " var_diff=" << var_diff << '\n';
+        }
+    }
+}
+
+}  // namespace
+
+int main() {
+    try {
+#ifdef DETECTOR_HAS_CUDA
+        int devices = 0;
+        if (cudaGetDeviceCount(&devices) != cudaSuccess || devices < 1) {
+            std::cout << "no CUDA device available; skipping CUDA training parity test\n";
+            return 0;
+        }
+        auto directory = std::filesystem::path(__FILE__).parent_path();
+        std::vector<float> graph_input(detector::Network::from_cfg((directory / "mini.cfg").string()).input_shape().elements(), 0.2f);
+        check_parity((directory / "mini.cfg").string(), graph_input, {{0, 0.5f, 0.5f, 0.25f, 0.25f}}, 5, 1, "bn_5step");
+
+        std::vector<float> shortcut_input{0.3f};
+        check_parity((directory / "shortcut-train.cfg").string(), shortcut_input,
+                     {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 5, 1, "shortcut");
+
+        // Minibatching: batch_size 3 should still match (both backends accumulate and apply once).
+        check_parity((directory / "shortcut-train.cfg").string(), shortcut_input,
+                     {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 9, 3, "shortcut+minibatch");
+
+        std::cout << "cuda training smoke passed\n";
+        return 0;
+#else
+        std::cout << "DETECTOR_HAS_CUDA not defined; nothing to test\n";
+        return 0;
+#endif
+    } catch (const std::exception& error) {
+        std::cerr << "cuda training smoke failed: " << error.what() << '\n';
+        return 1;
+    }
+}

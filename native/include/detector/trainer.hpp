@@ -46,6 +46,9 @@ public:
                       float weight_decay = 0.0005f, float bn_momentum = 0.99f);
     TrainResult step(const std::vector<float>& input, const std::vector<Target>& targets);
     float current_learning_rate() const { return schedule_.at(iteration_); }
+    // No-op: Trainer's weights already live on `network`. Lets callers that are generic over
+    // Trainer and CudaTrainer (which does need this to copy device weights back) call it unconditionally.
+    void sync_to_network() {}
 
 private:
     Network& network_;

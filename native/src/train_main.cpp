@@ -1,3 +1,4 @@
+#include "detector/cuda_trainer.hpp"
 #include "detector/image.hpp"
 #include "detector/trainer.hpp"
 #include <algorithm>
@@ -26,6 +27,7 @@ struct Options {
     std::vector<float> scales;
     float flip_probability = 0.0f;
     float exposure_jitter = 0.0f;  // max relative brightness deviation, e.g. 0.3 => factor in [0.7, 1.3]
+    std::string backend = "cpu";
 };
 
 std::vector<int> int_list(const std::string& value) {
@@ -62,6 +64,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--scales") options.scales = float_list(value);
         else if (key == "--flip-probability") options.flip_probability = std::stof(value);
         else if (key == "--exposure-jitter") options.exposure_jitter = std::stof(value);
+        else if (key == "--backend") options.backend = value;
         else throw std::runtime_error("unknown option: " + key);
     }
     if (options.epochs < 1 || options.epochs > 100000 || options.limit < 0)
@@ -73,6 +76,8 @@ Options options_from(int argc, char** argv) {
         throw std::runtime_error("invalid flip probability");
     if (!(options.exposure_jitter >= 0.0f && options.exposure_jitter < 1.0f))
         throw std::runtime_error("invalid exposure jitter");
+    if (options.backend != "cpu" && options.backend != "cuda")
+        throw std::runtime_error("--backend must be cpu or cuda");
     return options;
 }
 
@@ -114,6 +119,40 @@ std::vector<detector::Target> labels_from(const fs::path& path, const detector::
     return targets;
 }
 
+// Shared epoch loop for both Trainer (CPU) and CudaTrainer (GPU): same data pipeline
+// (letterbox, flip/exposure augmentation, labels), differing only in which trainer type steps
+// and whether its device-resident weights need syncing back to `network` before each checkpoint.
+template <typename TrainerT>
+void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::path>& images,
+                const fs::path& labels_dir, const fs::path& output_path, const Options& options,
+                std::mt19937& rng, bool sync_before_checkpoint) {
+    std::bernoulli_distribution flip_coin(options.flip_probability);
+    std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
+    for (int epoch = 1; epoch <= options.epochs; ++epoch) {
+        std::shuffle(images.begin(), images.end(), rng);
+        double loss_sum = 0;
+        std::size_t positives = 0;
+        for (const auto& path : images) {
+            auto image = detector::read_image(path.string());
+            auto box = detector::letterbox(image, network.input_shape());
+            auto labels = labels_from(labels_dir / (path.stem().string() + ".txt"), box, network.input_shape());
+            if (flip_coin(rng)) {
+                flip_horizontal(box.chw, network.input_shape());
+                for (auto& label : labels) label.cx = 1.0f - label.cx;
+            }
+            if (options.exposure_jitter > 0.0f) jitter_exposure(box.chw, exposure_dist(rng));
+            auto result = trainer.step(box.chw, labels);
+            loss_sum += result.loss;
+            positives += result.positives;
+        }
+        if (sync_before_checkpoint) trainer.sync_to_network();
+        network.save_weights(output_path.string());
+        std::cout << "epoch=" << epoch << " mean_loss=" << loss_sum / images.size()
+                  << " positives=" << positives << " lr=" << trainer.current_learning_rate()
+                  << " checkpoint=" << output_path.string() << '\n';
+    }
+}
+
 std::vector<fs::path> images_from(const fs::path& directory) {
     if (!fs::is_directory(directory)) throw std::runtime_error("not an image directory: " + directory.string());
     std::vector<fs::path> images;
@@ -138,7 +177,7 @@ int main(int argc, char** argv) {
             std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
                          "[--init weights] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
-                         "[--flip-probability 0.0] [--exposure-jitter 0.0]\n";
+                         "[--flip-probability 0.0] [--exposure-jitter 0.0] [--backend cpu|cuda]\n";
             return 2;
         }
         auto options = options_from(argc, argv);
@@ -149,38 +188,24 @@ int main(int argc, char** argv) {
         else network.load_weights(options.initial_weights);
         detector::LearningRateSchedule schedule{options.learning_rate, options.burn_in, 4.0f,
                                                  options.steps, options.scales};
-        detector::Trainer trainer(network, schedule, options.batch_size, options.decay);
         auto images = images_from(argv[2]);
         if (options.limit > 0 && images.size() > static_cast<std::size_t>(options.limit)) images.resize(options.limit);
         fs::path labels_dir = argv[3];
         std::mt19937 rng(options.seed);
-        std::bernoulli_distribution flip_coin(options.flip_probability);
-        std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
-        std::cout << "training_backend=cpu images=" << images.size() << " epochs=" << options.epochs
-                  << " batch=" << options.batch_size << " frozen_batchnorm=0"
+        std::cout << "training_backend=" << options.backend << " images=" << images.size()
+                  << " epochs=" << options.epochs << " batch=" << options.batch_size << " frozen_batchnorm=0"
                   << " flip_probability=" << options.flip_probability
                   << " exposure_jitter=" << options.exposure_jitter << "\n";
-        for (int epoch = 1; epoch <= options.epochs; ++epoch) {
-            std::shuffle(images.begin(), images.end(), rng);
-            double loss_sum = 0;
-            std::size_t positives = 0;
-            for (const auto& path : images) {
-                auto image = detector::read_image(path.string());
-                auto box = detector::letterbox(image, network.input_shape());
-                auto labels = labels_from(labels_dir / (path.stem().string() + ".txt"), box, network.input_shape());
-                if (flip_coin(rng)) {
-                    flip_horizontal(box.chw, network.input_shape());
-                    for (auto& label : labels) label.cx = 1.0f - label.cx;
-                }
-                if (options.exposure_jitter > 0.0f) jitter_exposure(box.chw, exposure_dist(rng));
-                auto result = trainer.step(box.chw, labels);
-                loss_sum += result.loss;
-                positives += result.positives;
-            }
-            network.save_weights(output_path.string());
-            std::cout << "epoch=" << epoch << " mean_loss=" << loss_sum / images.size()
-                      << " positives=" << positives << " lr=" << trainer.current_learning_rate()
-                      << " checkpoint=" << output_path.string() << '\n';
+        if (options.backend == "cuda") {
+#ifdef DETECTOR_HAS_CUDA
+            detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay);
+            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/true);
+#else
+            throw std::runtime_error("--backend cuda requires a build with -DDETECTOR_CUDA=ON");
+#endif
+        } else {
+            detector::Trainer trainer(network, schedule, options.batch_size, options.decay);
+            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/false);
         }
         return 0;
     } catch (const std::exception& error) {

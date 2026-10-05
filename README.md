@@ -1,184 +1,37 @@
-# Scratch YOLO detector for CUDA and Jetson
+# CUDA Neural Network Framework (in progress)
 
-The primary project is an independently implemented, YOLOv3-tiny-inspired
-20-class detector in `scratch_yolo/`. It has its own two-scale network,
-anchor assignment, training objective, VOC loader, raw-head decoder, and
-inference command. It starts from random weights; it does not import
-Darknet or Ultralytics code or pretrained weights. Architecture and anchor
-ideas follow the [original YOLOv3 paper](https://pjreddie.com/static/papers/YOLOv3.pdf)
-and [Darknet tiny configuration](https://github.com/pjreddie/darknet/blob/master/cfg/yolov3-tiny.cfg).
+An independently written C++/CUDA neural-network framework project inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet). It is not a fork and does not contain Darknet source. The goal is reusable training and inference across multiple models, with Jetson inference as a deployment target. **This goal is not complete yet.** The original fixed-shape MNIST CUDA CNN remains in this repository; `native/` is the newer configurable graph implementation. See the [scope and remaining work](docs/framework-status.md).
 
-This is a working *training prototype*, not a finished custom-CUDA inference
-engine. The network currently runs through PyTorch CPU/CUDA operations. The
-loss is deliberately simplified and is not claimed to reproduce Darknet
-training exactly. A 416-pixel GPU smoke run, raw-head ONNX export with
-numerical parity, and Jetson CPU ONNX/native TensorRT smoke tests passed.
-The two TensorRT raw heads matched ONNX CPU within 0.00009 maximum absolute
-error on one smoke image. The *trained* model has since been measured on the
-Jetson: 70.75 ms ONNX CPU and 14.99 ms native TensorRT FP16 mean end-to-end
-on one image. Native custom-CUDA network kernels remain unimplemented.
-The completed 30-epoch run selected epoch 30 by validation AP and measured
-0.0433 AP@0.5 on the held-out VOC 2007 test set; the pretrained YOLOv8n
-comparison measured 0.7569 with the same evaluator. This scratch recipe is
-not yet accurate enough for practical detection. See
-`docs/scratch-yolo-training.md` for exact settings and limitations.
-See `docs/scratch-yolo-jetson.md` for the trained-model timing and parity record.
+The graph currently supports convolution, max-pooling, dense (`[connected]`), route, upsample, YOLO heads, and terminal softmax. Configurable classifier examples include [linear](native/examples/mnist-linear.cfg), [two-layer dense](native/examples/mnist-mlp.cfg), and [convolutional](native/examples/mnist-conv.cfg) models. The IDX/MNIST CLI supports CPU or native CUDA SGD and inference for all three (batch size one, with no trainable batch normalization). The separate experimental YOLO CPU trainer has a simplified loss and is **not** equivalent to Darknet training.
 
-## Train the primary detector
+The YOLOv3-tiny application loads compatible Darknet `.weights` on CPU or CUDA and provides letterboxing, two-head decoding, class-aware NMS, benchmarking, and AP@0.5 evaluation. It remains a model validation case, not the whole framework.
 
-Prepare the official VOC 2007 trainval/test archives using the baseline-neutral
-`tools/prepare_voc2007.py` script below. Then use a CUDA-enabled PyTorch
-environment with NumPy and Pillow:
+For an actual 20-class YOLOv3-tiny model, the [VOC2007 training workflow](docs/yolov3-tiny-training.md) uses the unmodified original Darknet GPU trainer **externally** and evaluates its weights in this native engine. The completed 10,000-batch Jetson run reached **0.57379 validation mAP@0.5** (501 images); that validation-selected final checkpoint reached **0.55534 test mAP@0.5** (4,952 images). This is this project's all-point AP calculation on converted VOC labels, not an official VOC leaderboard score. The final local checkpoint and logs are in ignored `runs/yolov3-tiny-voc/`. No upstream source, original config, pretrained weights, dataset, or trained checkpoint is committed. The [optional ONNX/TensorRT path](docs/onnx-tensorrt.md) exports **these same Darknet weights** and runs FP32/FP16 engines through the same C++ YOLO decoder on Jetson. FP16 reached **0.55595 test mAP@0.5** and 11.970 ms mean in-memory pipeline time; ONNX/TensorRT are not required for native Darknet-format inference.
 
-~~~bash
-python -m tools.train_scratch_yolo --epochs 30 --side 416 --batch 16
-python -m tools.train_scratch_yolo --epochs 30 --side 416 --batch 16 --resume
-python -m tools.evaluate_scratch_yolo --weights runs/scratch_yolo/selected.pt
-python -m tools.evaluate_ultralytics_common --weights runs/voc2007/yolov8n/weights/best.pt
-python -m tools.predict_scratch_yolo --weights runs/scratch_yolo/selected.pt --image data/voc2007/yolo/images/test/000001.jpg
-python -m tools.export_scratch_yolo --weights runs/scratch_yolo/selected.pt --output runs/scratch_yolo/selected.onnx
-python -m tools.benchmark_scratch_jetson --model runs/scratch_yolo/selected.onnx --image data/voc2007/yolo/images/test/000001.jpg --backend cpu
-python -m unittest discover -s tests -p test_scratch_yolo.py
-~~~
+Build on Jetson Orin with CUDA and OpenCV development libraries:
 
-Training saves `best.pt` by validation loss, `last.pt`, periodic epoch
-checkpoints for validation-AP selection, and `summary.json`. Select
-`selected.pt` using the full-validation steps in `docs/scratch-yolo.md`
-before running the held-out test command above.
-These artifacts are ignored by Git. `--limit-train` and `--limit-val` are
-smoke-test options; checkpoints made with either flag are not trained models.
-TensorRT is **optional**, not required to train or evaluate the detector.
-The ONNX export has two *raw* heads, so it is not compatible with the older
-YOLOv8 ONNX runner. Use `benchmark_scratch_jetson.py` for it. A Jetson-built
-FP16 TensorRT engine can be passed with `--backend tensorrt-native`; this
-deployment path still needs trained-model validation. See
-`docs/scratch-yolo.md` for architecture, evaluation protocol, and limits.
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDETECTOR_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=87 -DDETECTOR_OPENCV=ON -DBUILD_TESTING=ON
+cmake --build build -j4
+ctest --test-dir build --output-on-failure
+```
 
-## Ultralytics YOLOv8n comparison baseline
+For CPU-only builds, use `-DDETECTOR_CUDA=OFF` and omit `CMAKE_CUDA_ARCHITECTURES`. Without OpenCV, input images must be PPM. Select the CUDA architecture for your GPU.
 
-The earlier, published work fine-tuned pretrained Ultralytics YOLOv8n on the
-same fixed VOC split. Its training, ONNX runner, and Jetson TensorRT results
-remain here for comparison only. They are **not** results of `scratch_yolo/`.
-YOLOv8n and YOLOv3-tiny are different architectures; a fair performance
-comparison needs the same test split, input size, evaluation implementation,
-Jetson power mode, and full-pipeline timing. The older MNIST CNN and unrelated
-post-processing prototype are recoverable in Git history, not this working tree.
+Train and evaluate a classifier from standard MNIST IDX files on Jetson. The downloaded files are in ignored `data/mnist/`; the [measured full-dataset runs](docs/mnist-jetson.md) reached **97.24% test accuracy** for a two-layer dense model and **97.27%** for a small CNN. Use a fresh output checkpoint name because the CLI refuses to overwrite existing weights:
 
-## Status and scope
+```sh
+./build/cuda_classifier train native/examples/mnist-mlp.cfg data/mnist/train-images-idx3-ubyte data/mnist/train-labels-idx1-ubyte runs/mnist/retrain-mlp.weights --backend cuda --epochs 3 --lr 0.01
+./build/cuda_classifier eval native/examples/mnist-mlp.cfg data/mnist/t10k-images-idx3-ubyte data/mnist/t10k-labels-idx1-ubyte runs/mnist/mnist-mlp-full.weights --backend cuda
+```
 
-- Working: YOLOv5/YOLOv8 ONNX image inference, box decoding, class-aware NMS,
-  YOLO label validation, and same-process latency benchmarking.
-- Optional: CUDA and TensorRT execution through ONNX Runtime when the installed
-  runtime exposes those providers. CPU is available as a reference backend.
-- Training: VOC 2007 conversion, fine-tuning, and held-out test evaluation
-  through tools/prepare_voc2007.py and tools/train_voc2007.py.
-- Measured on Jetson Orin Nano Super: ONNX Runtime CPU and native TensorRT FP16
-  full-detector timing, plus model-only TensorRT timing and board-input power.
-  ONNX Runtime CUDA/TensorRT provider tests are still pending.
+```sh
+./build/cuda_detector inspect runs/yolov3-tiny-voc/yolov3-tiny-voc.cfg
+./build/cuda_detector detect runs/yolov3-tiny-voc/yolov3-tiny-voc.cfg runs/yolov3-tiny-voc/final.weights image.jpg --backend cuda --names runs/yolov3-tiny-voc/voc.names
+./build/cuda_detector benchmark runs/yolov3-tiny-voc/yolov3-tiny-voc.cfg runs/yolov3-tiny-voc/final.weights image.jpg --backend cuda --scope pipeline --warmup 5 --iterations 30
+./build/cuda_detector_eval runs/yolov3-tiny-voc/yolov3-tiny-voc.cfg runs/yolov3-tiny-voc/final.weights images/test labels/test --backend cuda --confidence 0.01
+```
 
-No model weights or dataset are bundled. A trained ONNX model and test image
-are needed for inference or performance measurements.
+For TensorRT, export with `native/tools/export_darknet_onnx.py`, build the engine on the Jetson, and configure with `-DDETECTOR_TENSORRT=ON`; see the [tested commands and results](docs/onnx-tensorrt.md). Full YOLOv3 is not required for this path.
 
-## Train on Pascal VOC 2007
-
-Darknet documents Pascal VOC 2007 and 2012 as YOLO training data. This
-repository uses the smaller VOC 2007 subset for a laptop-scale experiment.
-Download the official train/validation and annotated test archives from
-https://www.pjreddie.com/projects/pascal-voc-dataset-mirror/ and extract
-both into data/voc2007. The result should include
-data/voc2007/VOCdevkit/VOC2007.
-
-~~~bash
-python tools/prepare_voc2007.py
-python tools/validate_yolo_dataset.py data/voc2007/yolo --classes data/voc2007/yolo/classes.txt
-python tools/train_voc2007.py --epochs 30 --imgsz 416 --batch 16
-python tools/evaluate_voc2007.py --weights runs/voc2007/yolov8n/weights/best.pt
-python tools/export_voc2007.py --weights runs/voc2007/yolov8n/weights/best.pt --imgsz 416
-~~~
-
-Use a CUDA-enabled PyTorch environment containing Ultralytics for training.
-The tested environment uses Python 3.10, PyTorch 2.8.0+cu126, and
-Ultralytics 8.3.175 on an RTX 3070 Ti Laptop GPU. Preparation shuffles the
-5,011 VOC train/validation IDs with seed 42 into 4,510 training and 501
-validation images. All 4,952 official test IDs stay held out. VOC difficult
-objects are excluded from training labels. The script saves best.pt and
-summary.json under runs/voc2007. If training was interrupted after writing
-the checkpoint, the standalone evaluation command can evaluate best.pt
-without repeating training. The ONNX export can be run in a separate
-CPU Python environment that has onnx, onnxruntime, and Ultralytics.
-Scores reported by Ultralytics use its current mAP implementation and
-should not be compared directly with historical Darknet VOC paper numbers.
-
-The YOLOv8n starting weights and training package come from Ultralytics.
-Ultralytics states that its software and trained models are AGPL-3.0 by
-default; review https://www.ultralytics.com/license before redistributing
-the trained checkpoint or deploying it in a private product. Dataset
-images and model weights are kept out of Git.
-
-The completed 30-epoch VOC 2007 run scored 0.771 mAP@0.5 and 0.557
-mAP@0.5:0.95 on the held-out 2007 test set. See
-docs/voc2007-training.md for the exact split, settings, per-class scores,
-artifact checksums, and local CPU baseline.
-
-## Jetson measurements
-
-On a Jetson Orin Nano Super in 25W mode, the warmed CPU ONNX detector measured
-62.27 ms mean end-to-end (16.06 FPS) on one held-out image. The native TensorRT
-FP16 detector measured 16.17 ms end-to-end (61.83 FPS) on that image. TensorRT's
-separate model-only `trtexec` test measured 2.86 ms host latency and 375
-inferences/s; that is not full-detector FPS. See docs/jetson-benchmark.md for
-methodology, commands, power samples, and limitations. TensorRT is optional.
-
-## Supported ONNX outputs
-
-The model must produce one decoded, non-NMS output tensor. Coordinates are
-center x, center y, width, height in input-image pixels. Scores are
-probabilities, not logits.
-
-| --format | Output shape | Fields |
-| --- | --- | --- |
-| v5 | [1, candidates, 5 + classes] | xywh, objectness, class scores |
-| v8 | [1, 4 + classes, candidates] | xywh, class scores |
-
-Raw anchor/grid heads, end-to-end NMS exports, and segmentation models are
-not yet supported.
-
-## Set up and run
-
-For a CPU smoke test, install the dependencies in requirements-cpu.txt.
-On Jetson, the CPU path needs ONNX Runtime. The CUDA and TensorRT backends in
-this runner require a compatible ONNX Runtime GPU build exposing those
-providers; the runner fails clearly if one is unavailable. Native TensorRT
-uses `--backend tensorrt-native` with a device-built `.engine` file and the
-installed TensorRT Python bindings. See docs/jetson-benchmark.md for setup.
-
-~~~bash
-python -m pip install -r requirements-cpu.txt
-python tools/yolo_inference.py --model model.onnx --image sample.jpg --format v8 --backend cpu --annotated result.jpg
-python tools/benchmark_jetson.py --model model.onnx --image sample.jpg --format v8 --backend cpu --runs 100 --warmup 10
-~~~
-
-Use --backend cuda or --backend tensorrt on a device with those providers.
-The benchmark loads the model and image once, warms up the session, then
-measures inference and preprocessing-plus-inference-plus-postprocessing
-latency. It reports the providers activated by ONNX Runtime. Provider
-activation alone does not prove every graph node ran on that provider.
-Keep model, input size, image, power mode, and clock settings fixed when
-comparing backends. JSON output includes the available Jetson release,
-power-mode, and clock-setting metadata; it does not yet sample watts.
-
-## Dataset validation
-
-Use images/train and labels/train, with optional val and test splits. A label
-line is: class_id x_center y_center width height, normalized to [0, 1].
-The classes file contains one name per line.
-
-~~~bash
-python tools/validate_yolo_dataset.py path/to/dataset --classes path/to/classes.txt
-~~~
-
-## Background
-
-The original CNN implementation is the author's prior project and remains
-in this repository's Git history. Darknet and YOLO informed the direction
-of the detector; no Darknet source code is included.
+Do not pair 80-class COCO weights with the 20-class VOC config. The included `native/tests/voc-smoke.cfg` is **not** YOLOv3-tiny. See [scope and Jetson measurements](docs/native-detector.md) for the implementation's limits.

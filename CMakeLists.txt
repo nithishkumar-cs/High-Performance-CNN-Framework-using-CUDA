@@ -61,6 +61,10 @@ if(BUILD_TESTING)
   target_link_libraries(detector_training_tests PRIVATE detector_core)
   add_test(NAME detector_training_smoke COMMAND detector_training_tests)
 
+  add_executable(detector_overfit_tests native/tests/overfit_smoke.cpp)
+  target_link_libraries(detector_overfit_tests PRIVATE detector_core)
+  add_test(NAME detector_overfit_smoke COMMAND detector_overfit_tests)
+
   add_executable(detector_metrics_tests native/tests/metrics_smoke.cpp)
   target_link_libraries(detector_metrics_tests PRIVATE detector_core)
   add_test(NAME detector_metrics_smoke COMMAND detector_metrics_tests)

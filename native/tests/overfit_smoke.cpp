@@ -65,7 +65,7 @@ int main() {
             std::vector<detector::Target> targets{{0, cx, cy, w, h}};
 
             detector::Trainer trainer(network, detector::LearningRateSchedule{0.1f}, 1, 0.0f);
-            for (int i = 0; i < 6000; ++i) trainer.step(input, targets);
+            for (int i = 0; i < 6000; ++i) trainer.step({input}, {targets});
 
             auto heads = network.forward(input, detector::Backend::cpu);
             auto boxes = detector::decode(network, heads, 0.1f, 0.45f);
@@ -95,7 +95,7 @@ int main() {
             std::vector<detector::Target> targets{small, large};
 
             detector::Trainer trainer(network, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
-            for (int i = 0; i < 4000; ++i) trainer.step(input, targets);
+            for (int i = 0; i < 4000; ++i) trainer.step({input}, {targets});
 
             auto heads = network.forward(input, detector::Backend::cpu);
             auto boxes = detector::decode(network, heads, 0.1f, 0.45f);

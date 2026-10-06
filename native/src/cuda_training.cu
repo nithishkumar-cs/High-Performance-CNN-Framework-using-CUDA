@@ -83,17 +83,28 @@ __global__ void convolution_forward_raw(const float* input, const float* weights
     raw[pos] = value;
 }
 
-__global__ void batch_norm_statistics(const float* raw, float* mean, float* variance, int filters, int plane) {
+// True minibatch batch-norm statistics: mean/variance per channel over every sample's spatial
+// (plane) positions, not just one sample's. `raw` holds `n` sample blocks of `sample_stride`
+// floats each (sample_stride == filters * plane); one thread per channel walks all n*plane
+// contributing elements. Replaces the old per-sample batch_norm_statistics.
+__global__ void batch_norm_statistics_batched(const float* raw, float* mean, float* variance, int filters,
+                                               int plane, int n, int sample_stride) {
     int oc = blockIdx.x * blockDim.x + threadIdx.x;
     if (oc >= filters) return;
-    const float* channel = raw + static_cast<std::size_t>(oc) * plane;
-    float sum = 0;
-    for (int p = 0; p < plane; ++p) sum += channel[p];
-    float m = sum / plane;
-    float var_sum = 0;
-    for (int p = 0; p < plane; ++p) { float d = channel[p] - m; var_sum += d * d; }
-    mean[oc] = m;
-    variance[oc] = var_sum / plane;
+    double sum = 0;
+    for (int s = 0; s < n; ++s) {
+        const float* channel = raw + static_cast<std::size_t>(s) * sample_stride + static_cast<std::size_t>(oc) * plane;
+        for (int p = 0; p < plane; ++p) sum += channel[p];
+    }
+    double total = static_cast<double>(n) * plane;
+    double m = sum / total;
+    double var_sum = 0;
+    for (int s = 0; s < n; ++s) {
+        const float* channel = raw + static_cast<std::size_t>(s) * sample_stride + static_cast<std::size_t>(oc) * plane;
+        for (int p = 0; p < plane; ++p) { double d = channel[p] - m; var_sum += d * d; }
+    }
+    mean[oc] = static_cast<float>(m);
+    variance[oc] = static_cast<float>(var_sum / total);
 }
 
 __global__ void batch_norm_apply(const float* raw, const float* mean, const float* variance,
@@ -158,46 +169,55 @@ __global__ void activation_backward(float* gradient, const float* preactivation,
     if (pos < count && leaky && preactivation[pos] < 0) gradient[pos] *= 0.1f;
 }
 
-// First batch-norm backward pass: per channel (one thread each), reduces g=dL/dvalue (already in
-// `g`, post activation_backward) and xhat into the sums BN backward needs, and accumulates this
-// sample's gamma/beta gradient directly (no atomics: one thread per channel, no cross-thread write).
-__global__ void batch_norm_backward_reduce(const float* g, const float* raw, const float* mean,
-                                           const float* variance, const float* gamma,
-                                           float* sum_dxhat, float* sum_dxhat_xhat,
-                                           float* scale_grad_accum, float* bias_grad_accum,
-                                           int filters, int plane) {
+// True-minibatch first backward pass: per channel (one thread each), reduces g=dL/dvalue
+// (already post activation_backward) and xhat into the sums BN backward needs, and gamma/beta
+// gradient, over every sample's spatial positions (not just one sample's). `g` and `raw` each
+// hold `n` sample blocks of `sample_stride` floats (sample_stride == filters * plane). Replaces
+// the old per-sample batch_norm_backward_reduce; no atomics needed (one thread per channel).
+__global__ void batch_norm_backward_reduce_batched(const float* g, const float* raw, const float* mean,
+                                                    const float* variance, const float* gamma,
+                                                    float* sum_dxhat, float* sum_dxhat_xhat,
+                                                    float* scale_grad_accum, float* bias_grad_accum,
+                                                    int filters, int plane, int n, int sample_stride) {
     int oc = blockIdx.x * blockDim.x + threadIdx.x;
     if (oc >= filters) return;
     float inv_std = 1.0f / sqrtf(variance[oc] + kBnEps);
-    const float* gc = g + static_cast<std::size_t>(oc) * plane;
-    const float* rc = raw + static_cast<std::size_t>(oc) * plane;
-    float sd = 0, sdx = 0, dgamma = 0, dbeta = 0;
-    for (int p = 0; p < plane; ++p) {
-        float xhat = (rc[p] - mean[oc]) * inv_std;
-        float dxhat = gc[p] * gamma[oc];
-        sd += dxhat;
-        sdx += dxhat * xhat;
-        dgamma += gc[p] * xhat;
-        dbeta += gc[p];
+    double sd = 0, sdx = 0, dgamma = 0, dbeta = 0;
+    for (int s = 0; s < n; ++s) {
+        const float* gc = g + static_cast<std::size_t>(s) * sample_stride + static_cast<std::size_t>(oc) * plane;
+        const float* rc = raw + static_cast<std::size_t>(s) * sample_stride + static_cast<std::size_t>(oc) * plane;
+        for (int p = 0; p < plane; ++p) {
+            float xhat = (rc[p] - mean[oc]) * inv_std;
+            float dxhat = gc[p] * gamma[oc];
+            sd += dxhat;
+            sdx += dxhat * xhat;
+            dgamma += gc[p] * xhat;
+            dbeta += gc[p];
+        }
     }
-    sum_dxhat[oc] = sd;
-    sum_dxhat_xhat[oc] = sdx;
-    scale_grad_accum[oc] += dgamma;
-    bias_grad_accum[oc] += dbeta;
+    sum_dxhat[oc] = static_cast<float>(sd);
+    sum_dxhat_xhat[oc] = static_cast<float>(sdx);
+    scale_grad_accum[oc] += static_cast<float>(dgamma);
+    bias_grad_accum[oc] += static_cast<float>(dbeta);
 }
 
-// Second pass: per output element, turns g into dz (gradient w.r.t. the pre-norm conv sum),
-// overwriting `g` in place so the same buffer feeds conv_backward_input/weight below.
+// Second pass: per output element of one sample, turns g into dz (gradient w.r.t. the pre-norm
+// conv sum), overwriting `g` in place so the same buffer feeds conv_backward_input/weight below.
+// `plane` is this sample's per-channel spatial size (for the oc lookup); `total_n` is the true
+// batch element count per channel (n * plane) the mean/variance/sums were computed over, which
+// is the correct normalizer here once n > 1 (equal to `plane` when n == 1, so behavior for a
+// single-sample call is unchanged).
 __global__ void batch_norm_backward_dz(float* g, const float* raw, const float* mean,
                                        const float* variance, const float* gamma,
-                                       const float* sum_dxhat, const float* sum_dxhat_xhat, int count, int plane) {
+                                       const float* sum_dxhat, const float* sum_dxhat_xhat,
+                                       int count, int plane, int total_n) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos >= count) return;
     int oc = pos / plane;
     float inv_std = 1.0f / sqrtf(variance[oc] + kBnEps);
     float xhat = (raw[pos] - mean[oc]) * inv_std;
     float dxhat = g[pos] * gamma[oc];
-    g[pos] = inv_std / plane * (plane * dxhat - sum_dxhat[oc] - xhat * sum_dxhat_xhat[oc]);
+    g[pos] = inv_std / total_n * (total_n * dxhat - sum_dxhat[oc] - xhat * sum_dxhat_xhat[oc]);
 }
 
 __global__ void bias_grad_reduce(const float* dz, float* bias_grad_accum, int filters, int plane) {
@@ -304,7 +324,6 @@ struct CudaTrainer::Impl {
     float weight_decay;
     float bn_momentum;
     int iteration = 0;
-    int accumulated = 0;
     DeviceMemory memory;
     float* input = nullptr;
     std::vector<float*> output, preactivation, gradient;
@@ -330,7 +349,11 @@ struct CudaTrainer::Impl {
                 layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo)
                 throw std::runtime_error("CUDA detector training supports convolutional, maxpool, route, "
                                           "upsample, shortcut and yolo layers only");
-        input = memory.floats(net.input_shape().elements());
+        // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
+        // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
+        // statistics (and every other per-sample forward/backward op) can run within one step().
+        const auto batch_elems = static_cast<std::size_t>(batch);
+        input = memory.floats(batch_elems * net.input_shape().elements());
         std::size_t n = layers.size();
         output.resize(n); preactivation.resize(n, nullptr); gradient.resize(n);
         raw.resize(n, nullptr); batch_mean.resize(n, nullptr); batch_var.resize(n, nullptr);
@@ -341,12 +364,12 @@ struct CudaTrainer::Impl {
         max_index.resize(n, nullptr);
         for (std::size_t i = 0; i < n; ++i) {
             const auto& layer = layers[i];
-            output[i] = memory.floats(layer.output.elements());
-            gradient[i] = memory.floats(layer.output.elements());
-            if (layer.kind == Kind::maxpool) { max_index[i] = memory.ints(layer.output.elements()); continue; }
-            if (layer.kind == Kind::shortcut) { preactivation[i] = memory.floats(layer.output.elements()); continue; }
+            output[i] = memory.floats(batch_elems * layer.output.elements());
+            gradient[i] = memory.floats(batch_elems * layer.output.elements());
+            if (layer.kind == Kind::maxpool) { max_index[i] = memory.ints(batch_elems * layer.output.elements()); continue; }
+            if (layer.kind == Kind::shortcut) { preactivation[i] = memory.floats(batch_elems * layer.output.elements()); continue; }
             if (layer.kind != Kind::convolutional) continue;
-            preactivation[i] = memory.floats(layer.output.elements());
+            preactivation[i] = memory.floats(batch_elems * layer.output.elements());
             std::size_t fan_in = static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
             if (layer.weights.size() != fan_in * layer.output.c || layer.biases.size() != static_cast<std::size_t>(layer.output.c))
                 throw std::runtime_error("initialize or load detector weights before CUDA training");
@@ -359,7 +382,7 @@ struct CudaTrainer::Impl {
                     layer.means.size() != static_cast<std::size_t>(layer.output.c) ||
                     layer.variances.size() != static_cast<std::size_t>(layer.output.c))
                     throw std::runtime_error("initialize or load batch-norm parameters before CUDA training");
-                raw[i] = memory.floats(layer.output.elements());
+                raw[i] = memory.floats(batch_elems * layer.output.elements());
                 batch_mean[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 batch_var[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 sum_dxhat[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
@@ -372,182 +395,248 @@ struct CudaTrainer::Impl {
         }
     }
 
-    TrainResult step(const std::vector<float>& host_input, const std::vector<Target>& targets) {
+    // `inputs.size()` (== n) must be between 1 and `batch_size`; device buffers are sample-major
+    // blocks of `batch_size` capacity, so this uses only their first n blocks.
+    TrainResult step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
+        const std::size_t n = inputs.size();
+        if (n == 0 || n > static_cast<std::size_t>(batch_size))
+            throw std::runtime_error("step() requires between 1 and batch_size samples");
+        if (targets.size() != n) throw std::runtime_error("inputs/targets length mismatch");
         const auto& layers = network.layers();
-        if (host_input.size() != network.input_shape().elements()) throw std::runtime_error("training input shape mismatch");
-        check(cudaMemcpy(input, host_input.data(), host_input.size() * sizeof(float), cudaMemcpyHostToDevice),
-              "cudaMemcpy training input");
+        std::size_t input_elems = network.input_shape().elements();
+        for (std::size_t s = 0; s < n; ++s) {
+            if (inputs[s].size() != input_elems) throw std::runtime_error("training input shape mismatch");
+            check(cudaMemcpy(input + s * input_elems, inputs[s].data(), input_elems * sizeof(float), cudaMemcpyHostToDevice),
+                  "cudaMemcpy training input");
+        }
 
-        // Forward.
+        // Forward: layer-major so every sample reaches a batch_normalize layer's raw pre-BN conv
+        // output before that layer's true batch statistics (computed over all n samples) are
+        // finalized and applied.
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
-            const float* previous = i ? output[i - 1] : input;
-            int elements = static_cast<int>(layer.output.elements());
+            std::size_t elems = layer.output.elements();
+            int elements = static_cast<int>(elems);
+            std::size_t prev_elems = i ? layers[i - 1].output.elements() : input_elems;
+            auto previous_of = [&](std::size_t s) -> const float* {
+                return (i ? output[i - 1] : input) + s * prev_elems;
+            };
             if (layer.kind == Kind::convolutional) {
                 int plane = layer.output.h * layer.output.w;
                 if (layer.batch_normalize) {
-                    convolution_forward_raw<<<blocks_for(elements), kThreads>>>(previous, weights[i], raw[i],
-                        layer.input.c, layer.input.h, layer.input.w, layer.output.c, layer.output.h, layer.output.w,
-                        layer.size, layer.stride, layer.padding);
+                    for (std::size_t s = 0; s < n; ++s) {
+                        convolution_forward_raw<<<blocks_for(elements), kThreads>>>(previous_of(s), weights[i], raw[i] + s * elems,
+                            layer.input.c, layer.input.h, layer.input.w, layer.output.c, layer.output.h, layer.output.w,
+                            layer.size, layer.stride, layer.padding);
+                        launch_check();
+                    }
+                    batch_norm_statistics_batched<<<blocks_for(layer.output.c), kThreads>>>(raw[i], batch_mean[i], batch_var[i],
+                        layer.output.c, plane, static_cast<int>(n), elements);
                     launch_check();
-                    batch_norm_statistics<<<blocks_for(layer.output.c), kThreads>>>(raw[i], batch_mean[i], batch_var[i],
-                        layer.output.c, plane);
-                    launch_check();
-                    batch_norm_apply<<<blocks_for(elements), kThreads>>>(raw[i], batch_mean[i], batch_var[i], scales[i],
-                        biases[i], preactivation[i], output[i], elements, plane, layer.leaky);
-                    launch_check();
+                    for (std::size_t s = 0; s < n; ++s) {
+                        batch_norm_apply<<<blocks_for(elements), kThreads>>>(raw[i] + s * elems, batch_mean[i], batch_var[i],
+                            scales[i], biases[i], preactivation[i] + s * elems, output[i] + s * elems, elements, plane, layer.leaky);
+                        launch_check();
+                    }
                     update_running_stats<<<blocks_for(layer.output.c), kThreads>>>(running_mean[i], running_variance[i],
                         batch_mean[i], batch_var[i], layer.output.c, bn_momentum);
                     launch_check();
                 } else {
-                    convolution_forward_plain<<<blocks_for(elements), kThreads>>>(previous, weights[i], biases[i],
-                        preactivation[i], output[i], layer.input.c, layer.input.h, layer.input.w,
-                        layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
-                    launch_check();
+                    for (std::size_t s = 0; s < n; ++s) {
+                        convolution_forward_plain<<<blocks_for(elements), kThreads>>>(previous_of(s), weights[i], biases[i],
+                            preactivation[i] + s * elems, output[i] + s * elems, layer.input.c, layer.input.h, layer.input.w,
+                            layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
+                        launch_check();
+                    }
                 }
             } else if (layer.kind == Kind::maxpool) {
-                max_pool_forward<<<blocks_for(elements), kThreads>>>(previous, output[i], max_index[i],
-                    layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.size, layer.stride);
-                launch_check();
-            } else if (layer.kind == Kind::route) {
-                std::size_t offset = 0;
-                for (int source : layer.sources) {
-                    std::size_t count = layers[static_cast<std::size_t>(source)].output.elements();
-                    check(cudaMemcpy(output[i] + offset, output[static_cast<std::size_t>(source)],
-                                     count * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy route");
-                    offset += count;
-                }
-            } else if (layer.kind == Kind::upsample) {
-                upsample_forward<<<blocks_for(elements), kThreads>>>(previous, output[i], layer.input.c,
-                    layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.stride);
-                launch_check();
-            } else if (layer.kind == Kind::shortcut) {
-                shortcut_forward<<<blocks_for(elements), kThreads>>>(previous,
-                    output[static_cast<std::size_t>(layer.sources.front())], preactivation[i], output[i], elements, layer.leaky);
-                launch_check();
-            } else {  // yolo: pass-through, matching the CPU trainer's forward for terminal heads.
-                check(cudaMemcpy(output[i], previous, static_cast<std::size_t>(elements) * sizeof(float),
-                                 cudaMemcpyDeviceToDevice), "cudaMemcpy yolo forward");
-            }
-        }
-
-        // YOLO loss: shared host-side assignment/gradient (identical math to the CPU trainer),
-        // computed only on the small head tensors downloaded here.
-        std::vector<std::vector<float>> host_output(layers.size()), host_gradient(layers.size());
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            if (layers[i].kind != Kind::yolo) continue;
-            host_output[i].resize(layers[i].output.elements());
-            check(cudaMemcpy(host_output[i].data(), output[i], host_output[i].size() * sizeof(float), cudaMemcpyDeviceToHost),
-                  "cudaMemcpy yolo output");
-            host_gradient[i].assign(host_output[i].size(), 0.0f);
-        }
-        auto loss_result = yolo_loss_and_gradient(network, targets, host_output, host_gradient);
-
-        // Backward: zero every gradient buffer, upload the yolo heads' host-computed gradient as
-        // the seed, then traverse layers in reverse; each kernel accumulates into its
-        // predecessor(s), since sequential launches on one stream see each other's prior writes.
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            int elements = static_cast<int>(layers[i].output.elements());
-            zero<<<blocks_for(elements), kThreads>>>(gradient[i], elements);
-            launch_check();
-        }
-        for (std::size_t i = 0; i < layers.size(); ++i) {
-            if (layers[i].kind != Kind::yolo) continue;
-            check(cudaMemcpy(gradient[i], host_gradient[i].data(), host_gradient[i].size() * sizeof(float),
-                             cudaMemcpyHostToDevice), "cudaMemcpy yolo gradient");
-        }
-        for (std::size_t reverse = layers.size(); reverse-- > 0;) {
-            const auto& layer = layers[reverse];
-            const float* previous = reverse ? output[reverse - 1] : input;
-            float* grad = gradient[reverse];
-            int elements = static_cast<int>(layer.output.elements());
-            if (layer.kind == Kind::yolo) {
-                if (reverse) { add_into<<<blocks_for(elements), kThreads>>>(gradient[reverse - 1], grad, elements); launch_check(); }
-            } else if (layer.kind == Kind::route) {
-                std::size_t offset = 0;
-                for (int source : layer.sources) {
-                    int count = static_cast<int>(layers[static_cast<std::size_t>(source)].output.elements());
-                    add_into<<<blocks_for(count), kThreads>>>(gradient[static_cast<std::size_t>(source)], grad + offset, count);
+                for (std::size_t s = 0; s < n; ++s) {
+                    max_pool_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems, max_index[i] + s * elems,
+                        layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.size, layer.stride);
                     launch_check();
-                    offset += static_cast<std::size_t>(count);
+                }
+            } else if (layer.kind == Kind::route) {
+                for (std::size_t s = 0; s < n; ++s) {
+                    std::size_t offset = 0;
+                    for (int source : layer.sources) {
+                        std::size_t count = layers[static_cast<std::size_t>(source)].output.elements();
+                        check(cudaMemcpy(output[i] + s * elems + offset, output[static_cast<std::size_t>(source)] + s * count,
+                                         count * sizeof(float), cudaMemcpyDeviceToDevice), "cudaMemcpy route");
+                        offset += count;
+                    }
                 }
             } else if (layer.kind == Kind::upsample) {
-                if (reverse) {
-                    upsample_backward<<<blocks_for(elements), kThreads>>>(grad, gradient[reverse - 1], layer.input.c,
+                for (std::size_t s = 0; s < n; ++s) {
+                    upsample_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems, layer.input.c,
                         layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.stride);
                     launch_check();
                 }
             } else if (layer.kind == Kind::shortcut) {
+                std::size_t source = static_cast<std::size_t>(layer.sources.front());
+                for (std::size_t s = 0; s < n; ++s) {
+                    shortcut_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[source] + s * elems,
+                        preactivation[i] + s * elems, output[i] + s * elems, elements, layer.leaky);
+                    launch_check();
+                }
+            } else {  // yolo: pass-through, matching the CPU trainer's forward for terminal heads.
+                for (std::size_t s = 0; s < n; ++s)
+                    check(cudaMemcpy(output[i] + s * elems, previous_of(s), elems * sizeof(float),
+                                     cudaMemcpyDeviceToDevice), "cudaMemcpy yolo forward");
+            }
+        }
+
+        // Zero every used gradient slot (the first n sample blocks of each layer) before seeding
+        // the YOLO heads' host-computed gradient, so backward's add_into kernels start from zero.
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            int count = static_cast<int>(n * layers[i].output.elements());
+            zero<<<blocks_for(count), kThreads>>>(gradient[i], count);
+            launch_check();
+        }
+
+        // YOLO loss: shared host-side assignment/gradient (identical math to the CPU trainer),
+        // computed per sample on only the small head tensors downloaded here.
+        float total_loss = 0;
+        std::size_t total_positives = 0;
+        std::vector<std::vector<float>> host_output(layers.size()), host_gradient(layers.size());
+        for (std::size_t s = 0; s < n; ++s) {
+            for (std::size_t i = 0; i < layers.size(); ++i) {
+                if (layers[i].kind != Kind::yolo) continue;
+                std::size_t elems = layers[i].output.elements();
+                host_output[i].resize(elems);
+                check(cudaMemcpy(host_output[i].data(), output[i] + s * elems, elems * sizeof(float), cudaMemcpyDeviceToHost),
+                      "cudaMemcpy yolo output");
+                host_gradient[i].assign(elems, 0.0f);
+            }
+            auto loss_result = yolo_loss_and_gradient(network, targets[s], host_output, host_gradient);
+            total_loss += loss_result.loss;
+            total_positives += loss_result.positives;
+            for (std::size_t i = 0; i < layers.size(); ++i) {
+                if (layers[i].kind != Kind::yolo) continue;
+                std::size_t elems = layers[i].output.elements();
+                check(cudaMemcpy(gradient[i] + s * elems, host_gradient[i].data(), elems * sizeof(float),
+                                 cudaMemcpyHostToDevice), "cudaMemcpy yolo gradient");
+            }
+        }
+
+        // Backward: traverse layers in reverse; each kernel accumulates into its predecessor(s),
+        // since sequential launches on one stream see each other's prior writes.
+        for (std::size_t reverse = layers.size(); reverse-- > 0;) {
+            const auto& layer = layers[reverse];
+            std::size_t elems = layer.output.elements();
+            int elements = static_cast<int>(elems);
+            std::size_t prev_elems = reverse ? layers[reverse - 1].output.elements() : input_elems;
+            auto previous_of = [&](std::size_t s) -> const float* {
+                return (reverse ? output[reverse - 1] : input) + s * prev_elems;
+            };
+            auto prev_grad_of = [&](std::size_t s) -> float* { return gradient[reverse - 1] + s * prev_elems; };
+            if (layer.kind == Kind::yolo) {
+                if (reverse)
+                    for (std::size_t s = 0; s < n; ++s) {
+                        add_into<<<blocks_for(elements), kThreads>>>(prev_grad_of(s), gradient[reverse] + s * elems, elements);
+                        launch_check();
+                    }
+            } else if (layer.kind == Kind::route) {
+                for (std::size_t s = 0; s < n; ++s) {
+                    std::size_t offset = 0;
+                    for (int source : layer.sources) {
+                        int count = static_cast<int>(layers[static_cast<std::size_t>(source)].output.elements());
+                        add_into<<<blocks_for(count), kThreads>>>(gradient[static_cast<std::size_t>(source)] + s * static_cast<std::size_t>(count),
+                            gradient[reverse] + s * elems + offset, count);
+                        launch_check();
+                        offset += static_cast<std::size_t>(count);
+                    }
+                }
+            } else if (layer.kind == Kind::upsample) {
+                if (reverse)
+                    for (std::size_t s = 0; s < n; ++s) {
+                        upsample_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, prev_grad_of(s),
+                            layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.stride);
+                        launch_check();
+                    }
+            } else if (layer.kind == Kind::shortcut) {
                 if (!reverse) throw std::runtime_error("shortcut cannot be the first layer");
-                activation_backward<<<blocks_for(elements), kThreads>>>(grad, preactivation[reverse], elements, layer.leaky);
-                launch_check();
-                shortcut_backward<<<blocks_for(elements), kThreads>>>(grad, gradient[reverse - 1],
-                    gradient[static_cast<std::size_t>(layer.sources.front())], elements);
-                launch_check();
+                std::size_t source = static_cast<std::size_t>(layer.sources.front());
+                for (std::size_t s = 0; s < n; ++s) {
+                    float* grad = gradient[reverse] + s * elems;
+                    activation_backward<<<blocks_for(elements), kThreads>>>(grad, preactivation[reverse] + s * elems, elements, layer.leaky);
+                    launch_check();
+                    shortcut_backward<<<blocks_for(elements), kThreads>>>(grad, prev_grad_of(s), gradient[source] + s * elems, elements);
+                    launch_check();
+                }
             } else if (layer.kind == Kind::maxpool) {
-                if (reverse) {
-                    max_pool_backward<<<blocks_for(elements), kThreads>>>(grad, max_index[reverse], gradient[reverse - 1], elements);
-                    launch_check();
-                }
+                if (reverse)
+                    for (std::size_t s = 0; s < n; ++s) {
+                        max_pool_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, max_index[reverse] + s * elems,
+                            prev_grad_of(s), elements);
+                        launch_check();
+                    }
             } else {  // convolutional
-                activation_backward<<<blocks_for(elements), kThreads>>>(grad, preactivation[reverse], elements, layer.leaky);
-                launch_check();
                 int plane = layer.output.h * layer.output.w;
-                if (layer.batch_normalize) {
-                    batch_norm_backward_reduce<<<blocks_for(layer.output.c), kThreads>>>(grad, raw[reverse], batch_mean[reverse],
-                        batch_var[reverse], scales[reverse], sum_dxhat[reverse], sum_dxhat_xhat[reverse],
-                        scale_grad_accum[reverse], bias_grad_accum[reverse], layer.output.c, plane);
-                    launch_check();
-                    batch_norm_backward_dz<<<blocks_for(elements), kThreads>>>(grad, raw[reverse], batch_mean[reverse],
-                        batch_var[reverse], scales[reverse], sum_dxhat[reverse], sum_dxhat_xhat[reverse], elements, plane);
-                    launch_check();
-                } else {
-                    bias_grad_reduce<<<blocks_for(layer.output.c), kThreads>>>(grad, bias_grad_accum[reverse], layer.output.c, plane);
+                for (std::size_t s = 0; s < n; ++s) {
+                    activation_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems,
+                        preactivation[reverse] + s * elems, elements, layer.leaky);
                     launch_check();
                 }
-                convolution_backward_weight<<<blocks_for(static_cast<int>(layer.weights.size())), kThreads>>>(
-                    grad, previous, weight_grad_accum[reverse], layer.input.c, layer.input.h, layer.input.w,
-                    layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
-                launch_check();
-                if (reverse) {
-                    convolution_backward_input<<<blocks_for(static_cast<int>(layer.input.elements())), kThreads>>>(
-                        grad, weights[reverse], gradient[reverse - 1], layer.input.c, layer.input.h, layer.input.w,
+                if (layer.batch_normalize) {
+                    batch_norm_backward_reduce_batched<<<blocks_for(layer.output.c), kThreads>>>(gradient[reverse], raw[reverse],
+                        batch_mean[reverse], batch_var[reverse], scales[reverse], sum_dxhat[reverse], sum_dxhat_xhat[reverse],
+                        scale_grad_accum[reverse], bias_grad_accum[reverse], layer.output.c, plane, static_cast<int>(n), elements);
+                    launch_check();
+                    int total_n = static_cast<int>(n) * plane;
+                    for (std::size_t s = 0; s < n; ++s) {
+                        batch_norm_backward_dz<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, raw[reverse] + s * elems,
+                            batch_mean[reverse], batch_var[reverse], scales[reverse], sum_dxhat[reverse], sum_dxhat_xhat[reverse],
+                            elements, plane, total_n);
+                        launch_check();
+                    }
+                } else {
+                    for (std::size_t s = 0; s < n; ++s) {
+                        bias_grad_reduce<<<blocks_for(layer.output.c), kThreads>>>(gradient[reverse] + s * elems, bias_grad_accum[reverse],
+                            layer.output.c, plane);
+                        launch_check();
+                    }
+                }
+                for (std::size_t s = 0; s < n; ++s) {
+                    convolution_backward_weight<<<blocks_for(static_cast<int>(layer.weights.size())), kThreads>>>(
+                        gradient[reverse] + s * elems, previous_of(s), weight_grad_accum[reverse], layer.input.c, layer.input.h, layer.input.w,
                         layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
                     launch_check();
+                    if (reverse) {
+                        convolution_backward_input<<<blocks_for(static_cast<int>(layer.input.elements())), kThreads>>>(
+                            gradient[reverse] + s * elems, weights[reverse], prev_grad_of(s), layer.input.c, layer.input.h, layer.input.w,
+                            layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
+                        launch_check();
+                    }
                 }
             }
         }
 
-        bool updated = false;
-        if (++accumulated >= batch_size) {
-            float lr = schedule.at(iteration);
-            float inv_batch = 1.0f / static_cast<float>(batch_size);
-            for (std::size_t i = 0; i < layers.size(); ++i) {
-                const auto& layer = layers[i];
-                if (layer.kind != Kind::convolutional) continue;
-                int wcount = static_cast<int>(layer.weights.size());
-                sgd_apply_with_decay<<<blocks_for(wcount), kThreads>>>(weights[i], weight_grad_accum[i], wcount, lr, inv_batch, weight_decay);
+        // One SGD update, averaged over this call's n samples (every call is a full minibatch).
+        float lr = schedule.at(iteration);
+        float inv_n = 1.0f / static_cast<float>(n);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& layer = layers[i];
+            if (layer.kind != Kind::convolutional) continue;
+            int wcount = static_cast<int>(layer.weights.size());
+            sgd_apply_with_decay<<<blocks_for(wcount), kThreads>>>(weights[i], weight_grad_accum[i], wcount, lr, inv_n, weight_decay);
+            launch_check();
+            sgd_apply<<<blocks_for(layer.output.c), kThreads>>>(biases[i], bias_grad_accum[i], layer.output.c, lr, inv_n);
+            launch_check();
+            zero<<<blocks_for(wcount), kThreads>>>(weight_grad_accum[i], wcount);
+            launch_check();
+            zero<<<blocks_for(layer.output.c), kThreads>>>(bias_grad_accum[i], layer.output.c);
+            launch_check();
+            if (layer.batch_normalize) {
+                sgd_apply<<<blocks_for(layer.output.c), kThreads>>>(scales[i], scale_grad_accum[i], layer.output.c, lr, inv_n);
                 launch_check();
-                sgd_apply<<<blocks_for(layer.output.c), kThreads>>>(biases[i], bias_grad_accum[i], layer.output.c, lr, inv_batch);
+                zero<<<blocks_for(layer.output.c), kThreads>>>(scale_grad_accum[i], layer.output.c);
                 launch_check();
-                zero<<<blocks_for(wcount), kThreads>>>(weight_grad_accum[i], wcount);
-                launch_check();
-                zero<<<blocks_for(layer.output.c), kThreads>>>(bias_grad_accum[i], layer.output.c);
-                launch_check();
-                if (layer.batch_normalize) {
-                    sgd_apply<<<blocks_for(layer.output.c), kThreads>>>(scales[i], scale_grad_accum[i], layer.output.c, lr, inv_batch);
-                    launch_check();
-                    zero<<<blocks_for(layer.output.c), kThreads>>>(scale_grad_accum[i], layer.output.c);
-                    launch_check();
-                }
             }
-            accumulated = 0;
-            ++iteration;
-            updated = true;
         }
+        ++iteration;
         check(cudaDeviceSynchronize(), "cudaDeviceSynchronize training");
-        if (!std::isfinite(loss_result.loss)) throw std::runtime_error("non-finite CUDA training loss");
-        return {loss_result.loss, targets.size(), updated};
+        if (!std::isfinite(total_loss)) throw std::runtime_error("non-finite CUDA training loss");
+        return {total_loss, total_positives};
     }
 
     float current_learning_rate() const { return schedule.at(iteration); }
@@ -576,8 +665,8 @@ struct CudaTrainer::Impl {
 CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay, float bn_momentum)
     : impl_(std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, bn_momentum)) {}
 CudaTrainer::~CudaTrainer() = default;
-TrainResult CudaTrainer::step(const std::vector<float>& input, const std::vector<Target>& targets) {
-    return impl_->step(input, targets);
+TrainResult CudaTrainer::step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
+    return impl_->step(inputs, targets);
 }
 float CudaTrainer::current_learning_rate() const { return impl_->current_learning_rate(); }
 void CudaTrainer::sync_to_network() { impl_->sync_to_network(); }

@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <iostream>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 #ifdef DETECTOR_HAS_CUDA
 #include <cuda_runtime.h>
@@ -16,12 +18,16 @@ void expect(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
-// Trains two freshly-initialized (same seed) copies of `cfg` for `steps` steps on the same
-// input/targets, one with the CPU Trainer and one with CudaTrainer, and asserts every learned
+// Trains two freshly-initialized (same seed) copies of `cfg` for `steps` applied-update
+// iterations, one with the CPU Trainer and one with CudaTrainer, and asserts every learned
 // parameter (weights, biases, and for batch_normalize layers scales/means/variances) matches
 // within a tight tolerance. This is the correctness evidence for the new CUDA training kernels:
 // it cross-checks against the CPU path already validated by the finite-difference gradient
-// check in training_smoke.cpp, rather than re-deriving the batch-norm math a second time.
+// check in training_smoke.cpp, rather than re-deriving the batch-norm math a second time. Each
+// iteration's minibatch is `batch_size` identical copies of `input`/`targets`: true batch-norm
+// statistics over N identical copies equal that one sample's own statistics, so this keeps
+// exercising the real batched code path (not a batch_size=1 shortcut) while staying comparable
+// to a single, known input/target pair.
 void check_parity(const std::string& cfg, const std::vector<float>& input,
                    const std::vector<detector::Target>& targets, int steps, int batch_size,
                    const char* label) {
@@ -32,11 +38,13 @@ void check_parity(const std::string& cfg, const std::vector<float>& input,
 
     detector::Trainer cpu_trainer(cpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
     detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
+    std::vector<std::vector<float>> batch_inputs(static_cast<std::size_t>(batch_size), input);
+    std::vector<std::vector<detector::Target>> batch_targets(static_cast<std::size_t>(batch_size), targets);
 
     float cpu_loss = 0, gpu_loss = 0;
     for (int i = 0; i < steps; ++i) {
-        cpu_loss = cpu_trainer.step(input, targets).loss;
-        gpu_loss = gpu_trainer.step(input, targets).loss;
+        cpu_loss = cpu_trainer.step(batch_inputs, batch_targets).loss;
+        gpu_loss = gpu_trainer.step(batch_inputs, batch_targets).loss;
     }
     gpu_trainer.sync_to_network();
 
@@ -86,6 +94,45 @@ void check_parity(const std::string& cfg, const std::vector<float>& input,
     }
 }
 
+// Like check_parity, but the minibatch holds `samples.size()` genuinely *different* inputs
+// (not `batch_size` identical copies), so the batch mean/variance differ from any single
+// sample's own statistics. This is the decisive CPU/GPU cross-check for the new batched
+// batch-norm reduction kernels: a bug in the cross-sample sums (or the total_n normalizer)
+// would show up here even if it happened to cancel out in the identical-copies case above.
+void check_parity_batch(const std::string& cfg,
+                        const std::vector<std::pair<std::vector<float>, std::vector<detector::Target>>>& samples,
+                        int steps, const char* label) {
+    auto cpu_net = detector::Network::from_cfg(cfg);
+    cpu_net.initialize_random(17);
+    auto gpu_net = detector::Network::from_cfg(cfg);
+    gpu_net.initialize_random(17);
+    int batch_size = static_cast<int>(samples.size());
+    detector::Trainer cpu_trainer(cpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
+    detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
+    std::vector<std::vector<float>> inputs;
+    std::vector<std::vector<detector::Target>> targets;
+    for (const auto& sample : samples) { inputs.push_back(sample.first); targets.push_back(sample.second); }
+
+    float cpu_loss = 0, gpu_loss = 0;
+    for (int i = 0; i < steps; ++i) {
+        cpu_loss = cpu_trainer.step(inputs, targets).loss;
+        gpu_loss = gpu_trainer.step(inputs, targets).loss;
+    }
+    gpu_trainer.sync_to_network();
+    std::cout << "cuda_training_parity " << label << " cpu_loss=" << cpu_loss << " gpu_loss=" << gpu_loss << '\n';
+    expect(std::abs(cpu_loss - gpu_loss) < 1e-2f * std::max(1.0f, std::abs(cpu_loss)), "CPU/GPU loss mismatch (distinct batch)");
+    const auto& cpu_layers = cpu_net.layers();
+    const auto& gpu_layers = gpu_net.layers();
+    for (std::size_t i = 0; i < cpu_layers.size(); ++i) {
+        const auto& a = cpu_layers[i];
+        const auto& b = gpu_layers[i];
+        auto close = [](float x, float y) { return std::abs(x - y) < 1e-2f * std::max(1.0f, std::abs(x)); };
+        for (std::size_t p = 0; p < a.weights.size(); ++p) expect(close(a.weights[p], b.weights[p]), "weight mismatch (distinct batch)");
+        if (a.batch_normalize)
+            for (std::size_t p = 0; p < a.scales.size(); ++p) expect(close(a.scales[p], b.scales[p]), "scale mismatch (distinct batch)");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -104,9 +151,16 @@ int main() {
         check_parity((directory / "shortcut-train.cfg").string(), shortcut_input,
                      {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 5, 1, "shortcut");
 
-        // Minibatching: batch_size 3 should still match (both backends accumulate and apply once).
+        // True minibatch: batch_size 3 (of identical copies, see check_parity) should still match.
         check_parity((directory / "shortcut-train.cfg").string(), shortcut_input,
-                     {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 9, 3, "shortcut+minibatch");
+                     {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 3, 3, "shortcut+minibatch");
+
+        // Decisive true-batch batch-norm check: two genuinely different samples in one minibatch.
+        std::vector<float> graph_input_b(graph_input.size());
+        for (std::size_t i = 0; i < graph_input_b.size(); ++i) graph_input_b[i] = 0.1f + 0.05f * static_cast<float>(i % 5);
+        check_parity_batch((directory / "mini.cfg").string(),
+                           {{graph_input, {{0, 0.5f, 0.5f, 0.25f, 0.25f}}}, {graph_input_b, {{0, 0.3f, 0.7f, 0.2f, 0.3f}}}},
+                           5, "bn_distinct_batch");
 
         std::cout << "cuda training smoke passed\n";
         return 0;

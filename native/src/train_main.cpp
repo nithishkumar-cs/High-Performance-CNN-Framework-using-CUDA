@@ -10,6 +10,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -214,6 +215,8 @@ void letterbox_target(detector::Target& target, const detector::Letterbox& box, 
 // Shared epoch loop for both Trainer (CPU) and CudaTrainer (GPU): same data pipeline (random
 // crop, letterbox, flip/HSV augmentation, labels), differing only in which trainer type steps
 // and whether its device-resident weights need syncing back to `network` before each checkpoint.
+// Samples are assembled into minibatches of `options.batch_size` (a smaller final batch per
+// epoch is fine) so step() computes true cross-sample batch-norm statistics, not per-sample ones.
 template <typename TrainerT>
 void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::path>& images,
                 const fs::path& labels_dir, const fs::path& output_path, const Options& options,
@@ -226,6 +229,16 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
         std::shuffle(images.begin(), images.end(), rng);
         double loss_sum = 0;
         std::size_t positives = 0;
+        std::vector<std::vector<float>> batch_inputs;
+        std::vector<std::vector<detector::Target>> batch_targets;
+        auto flush_batch = [&] {
+            if (batch_inputs.empty()) return;
+            auto result = trainer.step(batch_inputs, batch_targets);
+            loss_sum += result.loss;
+            positives += result.positives;
+            batch_inputs.clear();
+            batch_targets.clear();
+        };
         for (const auto& path : images) {
             auto image = detector::read_image(path.string());
             auto labels = raw_labels_from(labels_dir / (path.stem().string() + ".txt"));
@@ -245,10 +258,11 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
             }
             if (options.exposure_jitter > 0.0f || options.saturation_jitter > 0.0f || options.hue_jitter > 0.0f)
                 jitter_hsv(box.chw, network.input_shape(), hue_dist(rng), saturation_dist(rng), exposure_dist(rng));
-            auto result = trainer.step(box.chw, labels);
-            loss_sum += result.loss;
-            positives += result.positives;
+            batch_inputs.push_back(std::move(box.chw));
+            batch_targets.push_back(std::move(labels));
+            if (batch_inputs.size() >= static_cast<std::size_t>(options.batch_size)) flush_batch();
         }
+        flush_batch();  // final, possibly smaller, partial batch
         if (sync_before_checkpoint) trainer.sync_to_network();
         network.save_weights(output_path.string());
         std::cout << "epoch=" << epoch << " mean_loss=" << loss_sum / images.size()

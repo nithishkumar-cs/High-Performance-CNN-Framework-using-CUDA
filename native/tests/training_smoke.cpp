@@ -21,9 +21,9 @@ int main() {
         detector::Trainer trainer(network, detector::LearningRateSchedule{0.1f}, 1, 0.0f);
         std::vector<float> input{1.0f, 0.5f, 0.25f};
         std::vector<detector::Target> targets{{0, 0.5f, 0.5f, 0.5f, 0.5f}};
-        float first = trainer.step(input, targets).loss;
+        float first = trainer.step({input}, {targets}).loss;
         float last = first;
-        for (int i = 0; i < 99; ++i) last = trainer.step(input, targets).loss;
+        for (int i = 0; i < 99; ++i) last = trainer.step({input}, {targets}).loss;
         std::cout << "first_loss=" << first << " last_loss=" << last << "\n";
         expect(std::isfinite(last) && last < first - 0.5f, "single-box loss did not fall");
         auto expected = network.forward(input, detector::Backend::cpu)[0].values;
@@ -39,9 +39,9 @@ int main() {
         auto graph = detector::Network::from_cfg((directory / "mini.cfg").string());
         graph.initialize_random(9);
         detector::Trainer graph_trainer(graph, detector::LearningRateSchedule{0.0001f}, 1);
-        auto result = graph_trainer.step(std::vector<float>(graph.input_shape().elements(), 0.2f),
-                                         {{0, 0.5f, 0.5f, 0.25f, 0.25f}});
-        expect(std::isfinite(result.loss) && result.positives == 1 && result.updated,
+        auto result = graph_trainer.step({std::vector<float>(graph.input_shape().elements(), 0.2f)},
+                                         {{{0, 0.5f, 0.5f, 0.25f, 0.25f}}});
+        expect(std::isfinite(result.loss) && result.positives == 1,
                "branched graph (batch-normalize + route + upsample) training step");
 
         // Shortcut (residual) layer: forward+backward must run and reduce loss on a repeated target,
@@ -51,25 +51,31 @@ int main() {
         detector::Trainer shortcut_trainer(shortcut_net, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
         std::vector<float> shortcut_input{0.3f};
         std::vector<detector::Target> shortcut_targets{{0, 0.5f, 0.5f, 0.5f, 0.5f}};
-        float shortcut_first = shortcut_trainer.step(shortcut_input, shortcut_targets).loss;
+        float shortcut_first = shortcut_trainer.step({shortcut_input}, {shortcut_targets}).loss;
         float shortcut_last = shortcut_first;
-        for (int i = 0; i < 49; ++i) shortcut_last = shortcut_trainer.step(shortcut_input, shortcut_targets).loss;
+        for (int i = 0; i < 49; ++i) shortcut_last = shortcut_trainer.step({shortcut_input}, {shortcut_targets}).loss;
         expect(std::isfinite(shortcut_last) && shortcut_last < shortcut_first, "shortcut layer loss did not fall");
 
-        // Minibatching: with batch_size 4, only every 4th step() call applies an SGD update, and
-        // weights must stay frozen between those updates (pure gradient accumulation in between).
-        auto batch_net = detector::Network::from_cfg((directory / "train-mini.cfg").string());
-        batch_net.initialize_random(13);
-        detector::Trainer batch_trainer(batch_net, detector::LearningRateSchedule{0.1f}, 4, 0.0f);
-        auto weights_before = batch_net.layers()[0].weights;
-        for (int i = 0; i < 3; ++i) {
-            auto step_result = batch_trainer.step(input, targets);
-            expect(!step_result.updated, "minibatch applied update before batch_size samples accumulated");
-            expect(batch_net.layers()[0].weights == weights_before, "weights changed before minibatch boundary");
-        }
-        auto fourth = batch_trainer.step(input, targets);
-        expect(fourth.updated, "minibatch did not apply update at batch_size boundary");
-        expect(batch_net.layers()[0].weights != weights_before, "weights unchanged at minibatch boundary");
+        // True minibatch batch-norm: a single step() call with `batch_size` identical copies of
+        // one sample must learn exactly as a batch_size=1 trainer does on that one sample, since
+        // batch statistics over N identical copies equal that one sample's own statistics, and
+        // averaging N identical gradients equals the single gradient. Uses mini.cfg (has a
+        // batch_normalize layer) so this actually exercises the batched statistics path.
+        auto graph_input = std::vector<float>(graph.input_shape().elements(), 0.2f);
+        std::vector<detector::Target> graph_targets{{0, 0.5f, 0.5f, 0.25f, 0.25f}};
+        auto reference_net = detector::Network::from_cfg((directory / "mini.cfg").string());
+        reference_net.initialize_random(21);
+        detector::Trainer reference_trainer(reference_net, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
+        reference_trainer.step({graph_input}, {graph_targets});
+
+        auto batch_net = detector::Network::from_cfg((directory / "mini.cfg").string());
+        batch_net.initialize_random(21);
+        detector::Trainer batch_trainer(batch_net, detector::LearningRateSchedule{0.05f}, 4, 0.0f);
+        batch_trainer.step(std::vector<std::vector<float>>(4, graph_input), std::vector<std::vector<detector::Target>>(4, graph_targets));
+        expect(batch_net.layers()[0].weights.size() == reference_net.layers()[0].weights.size(), "weight count mismatch");
+        for (std::size_t p = 0; p < batch_net.layers()[0].weights.size(); ++p)
+            expect(std::abs(batch_net.layers()[0].weights[p] - reference_net.layers()[0].weights[p]) < 1e-5f,
+                   "batch of identical samples did not match single-sample training");
 
         // Learning-rate schedule: linear burn-in then a step decay, matching Darknet's policy.
         detector::LearningRateSchedule schedule{1.0f, 4, 4.0f, {10}, {0.1f}};
@@ -91,7 +97,7 @@ int main() {
             else if (param == 1) net.layer(0).biases[0] += delta;
             else net.layer(0).weights[0] += delta;
             detector::Trainer t(net, detector::LearningRateSchedule{1e-9f}, 1, 0.0f);
-            return t.step(gc_input, gc_targets).loss;
+            return t.step({gc_input}, {gc_targets}).loss;
         };
         auto analytic_grad = [&](int param) {
             auto net = detector::Network::from_cfg(bn_cfg);
@@ -99,7 +105,7 @@ int main() {
             float before = param == 0 ? net.layer(0).scales[0] : param == 1 ? net.layer(0).biases[0] : net.layer(0).weights[0];
             float lr = 1e-4f;
             detector::Trainer t(net, detector::LearningRateSchedule{lr}, 1, 0.0f);
-            t.step(gc_input, gc_targets);
+            t.step({gc_input}, {gc_targets});
             float after = param == 0 ? net.layer(0).scales[0] : param == 1 ? net.layer(0).biases[0] : net.layer(0).weights[0];
             return (before - after) / lr;
         };
@@ -111,6 +117,41 @@ int main() {
             float tolerance = 2e-2f * std::max(1.0f, std::abs(numeric));
             std::cout << "bn_grad_check " << names[param] << " numeric=" << numeric << " analytic=" << analytic << '\n';
             expect(std::abs(numeric - analytic) < tolerance, "batch-norm backward gradient check failed");
+        }
+
+        // Finite-difference gradient check for TRUE minibatch batch-norm statistics: two
+        // *different* samples in one step() call, so batch mean/variance differ from either
+        // sample's own statistics and the backward sums must correctly combine both samples'
+        // contributions (the total_n = n*plane normalizer). step()'s returned loss is already
+        // summed over the batch, so its finite difference is directly comparable to the SGD
+        // update's accumulated (not averaged) gradient, i.e. (before - after) / lr * n.
+        std::vector<float> gc_input_b{0.4f, 0.1f, 0.3f, 0.2f};
+        std::vector<detector::Target> gc_targets_b{{0, 0.3f, 0.6f, 0.2f, 0.4f}};
+        auto batch_loss_with = [&](int param, float delta) {
+            auto net = detector::Network::from_cfg(bn_cfg);
+            net.initialize_random(5);
+            if (param == 0) net.layer(0).scales[0] += delta;
+            else if (param == 1) net.layer(0).biases[0] += delta;
+            else net.layer(0).weights[0] += delta;
+            detector::Trainer t(net, detector::LearningRateSchedule{1e-9f}, 2, 0.0f);
+            return t.step({gc_input, gc_input_b}, {gc_targets, gc_targets_b}).loss;
+        };
+        auto batch_analytic_grad = [&](int param) {
+            auto net = detector::Network::from_cfg(bn_cfg);
+            net.initialize_random(5);
+            float before = param == 0 ? net.layer(0).scales[0] : param == 1 ? net.layer(0).biases[0] : net.layer(0).weights[0];
+            float lr = 1e-4f;
+            detector::Trainer t(net, detector::LearningRateSchedule{lr}, 2, 0.0f);
+            t.step({gc_input, gc_input_b}, {gc_targets, gc_targets_b});
+            float after = param == 0 ? net.layer(0).scales[0] : param == 1 ? net.layer(0).biases[0] : net.layer(0).weights[0];
+            return (before - after) / lr * 2.0f;
+        };
+        for (int param = 0; param < 3; ++param) {
+            float numeric = (batch_loss_with(param, eps) - batch_loss_with(param, -eps)) / (2 * eps);
+            float analytic = batch_analytic_grad(param);
+            float tolerance = 2e-2f * std::max(1.0f, std::abs(numeric));
+            std::cout << "batch_bn_grad_check " << names[param] << " numeric=" << numeric << " analytic=" << analytic << '\n';
+            expect(std::abs(numeric - analytic) < tolerance, "true minibatch batch-norm backward gradient check failed");
         }
 
         // ignore_thresh: a non-assigned anchor at the target's cell whose decoded predicted box

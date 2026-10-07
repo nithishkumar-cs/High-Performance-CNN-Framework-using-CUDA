@@ -331,7 +331,7 @@ Network Network::from_cfg(const std::string& path) {
     return net;
 }
 
-void Network::load_weights(const std::string& path) {
+void Network::load_weights(const std::string& path, int layer_limit) {
     std::ifstream file(path, std::ios::binary);
     if (!file) throw std::runtime_error("cannot open weights: " + path);
     std::int32_t major, minor, revision;
@@ -339,7 +339,9 @@ void Network::load_weights(const std::string& path) {
     if (major < 0 || minor < 0 || major >= 1000 || minor >= 1000) throw std::runtime_error("unsupported weights version");
     if (major * 10 + minor >= 2) { std::uint64_t seen; read_scalar(file, seen); }
     else { std::uint32_t seen; read_scalar(file, seen); }
-    for (std::size_t i = 0; i < layers_.size(); ++i) {
+    bool partial = layer_limit >= 0;
+    std::size_t limit = partial ? std::min(static_cast<std::size_t>(layer_limit), layers_.size()) : layers_.size();
+    for (std::size_t i = 0; i < limit; ++i) {
         auto& layer = layers_[i];
         if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
         auto count = static_cast<std::size_t>(layer.filters);
@@ -353,6 +355,7 @@ void Network::load_weights(const std::string& path) {
             static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
         read_floats(file, layer.weights, count * fan_in, i);
     }
+    if (partial) return;  // caller intentionally stops before the rest of a larger source file.
     char trailing = 0;
     if (file.read(&trailing, 1)) throw std::runtime_error("weights contain trailing data; cfg may not match weights");
     if (!file.eof()) throw std::runtime_error("error reading weights file");

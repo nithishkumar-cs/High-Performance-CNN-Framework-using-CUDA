@@ -120,6 +120,30 @@ int main() {
         }
 #endif
 
+        // Partial (pretrained-backbone) load: Darknet's `partial N` transfer loads only the first
+        // N layers from a weights file sized for a larger network and leaves the rest random-init.
+        auto partial_net = detector::Network::from_cfg(cfg.string());
+        partial_net.initialize_random(7);
+        std::vector<float> layer2_before = partial_net.layer(2).weights;
+        const auto partial_weights = std::filesystem::current_path() / "detector_partial_smoke.weights";
+        write_weights(partial_weights);  // full 3-conv-block file; layer_limit=1 should read only block 0.
+        partial_net.load_weights(partial_weights.string(), 1);
+        std::filesystem::remove(partial_weights);
+        expect(partial_net.layer(0).biases.size() == 6 && partial_net.layer(0).scales[0] == 1.0f,
+               "partial load applied layer 0 from file");
+        expect(partial_net.layer(2).weights == layer2_before,
+               "partial load left layer 2 at its pre-call (random) value");
+        const auto strict_weights = std::filesystem::current_path() / "detector_strict_smoke.weights";
+        write_weights(strict_weights);
+        // Append one stray byte so a full (non-partial) load must reject it as trailing data.
+        { std::ofstream append(strict_weights, std::ios::binary | std::ios::app); char pad = 0; append.write(&pad, 1); }
+        bool full_load_threw = false;
+        try {
+            detector::Network::from_cfg(cfg.string()).load_weights(strict_weights.string());
+        } catch (const std::runtime_error&) { full_load_threw = true; }
+        std::filesystem::remove(strict_weights);
+        expect(full_load_threw, "full load must reject trailing data that a partial load would ignore");
+
         std::cout << "detector smoke tests passed\n";
         return 0;
     } catch (const std::exception& error) {

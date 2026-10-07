@@ -23,6 +23,8 @@ struct Options {
     float decay = 0.0005f;
     std::uint32_t seed = 2026;
     std::string initial_weights;
+    int init_layers = -1;  // -1: full load of initial_weights; >=0: partial/pretrained-backbone load
+                            // (Darknet `partial N`) - random-init first, then overlay layers [0, N).
     int batch_size = 1;
     int burn_in = 0;
     std::vector<int> steps;
@@ -63,6 +65,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--decay") options.decay = std::stof(value);
         else if (key == "--seed") options.seed = static_cast<std::uint32_t>(std::stoul(value));
         else if (key == "--init") options.initial_weights = value;
+        else if (key == "--init-layers") options.init_layers = std::stoi(value);
         else if (key == "--batch") options.batch_size = std::stoi(value);
         else if (key == "--burn-in") options.burn_in = std::stoi(value);
         else if (key == "--steps") options.steps = int_list(value);
@@ -77,6 +80,8 @@ Options options_from(int argc, char** argv) {
     }
     if (options.epochs < 1 || options.epochs > 100000 || options.limit < 0)
         throw std::runtime_error("invalid epochs or limit");
+    if (options.init_layers >= 0 && options.initial_weights.empty())
+        throw std::runtime_error("--init-layers requires --init");
     if (options.batch_size < 1) throw std::runtime_error("invalid batch size");
     if (options.steps.size() != options.scales.size())
         throw std::runtime_error("--steps and --scales must have the same length");
@@ -293,7 +298,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 5) {
             std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
-                         "[--init weights] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
+                         "[--init weights] [--init-layers N] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
                          "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
                          "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda]\n";
@@ -303,8 +308,16 @@ int main(int argc, char** argv) {
         fs::path output_path = argv[4];
         if (fs::exists(output_path)) throw std::runtime_error("refusing to overwrite existing output: " + output_path.string());
         auto network = detector::Network::from_cfg(argv[1]);
-        if (options.initial_weights.empty()) network.initialize_random(options.seed);
-        else network.load_weights(options.initial_weights);
+        if (options.initial_weights.empty()) {
+            network.initialize_random(options.seed);
+        } else if (options.init_layers < 0) {
+            network.load_weights(options.initial_weights);
+        } else {
+            // Pretrained-backbone transfer: random-init every layer first (so shape-diverging
+            // head layers get a valid init), then overlay the pretrained file's first N layers.
+            network.initialize_random(options.seed);
+            network.load_weights(options.initial_weights, options.init_layers);
+        }
         detector::LearningRateSchedule schedule{options.learning_rate, options.burn_in, 4.0f,
                                                  options.steps, options.scales};
         auto images = images_from(argv[2]);

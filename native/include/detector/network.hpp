@@ -59,7 +59,12 @@ struct Detection {
 class Network {
 public:
     static Network from_cfg(const std::string& path);
-    void load_weights(const std::string& path);
+    // layer_limit < 0 (default) loads every layer and rejects trailing/short data (full-file load).
+    // layer_limit >= 0 loads only layers [0, layer_limit) from `path` and leaves the rest of the
+    // network untouched (e.g. after initialize_random()); this is Darknet's `partial N` transfer -
+    // seeding a pretrained backbone whose later (shape-diverging) head layers are skipped - without
+    // needing an intermediate truncated weights file, since it simply stops reading `path` early.
+    void load_weights(const std::string& path, int layer_limit = -1);
     void initialize_random(std::uint32_t seed);
     void save_weights(const std::string& path) const;
     Shape input_shape() const { return input_; }

@@ -39,10 +39,14 @@ struct Assignment {
     float offset_y = 0;
     float log_width = 0;
     float log_height = 0;
+    // Darknet's (2 - truth.w*truth.h) coordinate-loss scale (truth fractions of the network
+    // input); up-weights small boxes relative to large ones. Applied to x/y/w/h only.
+    float box_scale = 1.0f;
 };
 
 }  // namespace
 
+// Compute the per-image YOLO loss and raw-head gradients for both training backends.
 YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<Target>& targets,
                                        const std::vector<std::vector<float>>& output,
                                        std::vector<std::vector<float>>& gradient) {
@@ -79,14 +83,11 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
             cell_y * layer.output.w + cell_x, target.class_id,
             std::clamp(grid_x - cell_x, 0.0f, 1.0f), std::clamp(grid_y - cell_y, 0.0f, 1.0f),
             std::log(target.width * input.w / aw),
-            std::log(target.height * input.h / ah)});
+            std::log(target.height * input.h / ah),
+            2.0f - target.width * target.height});
     }
 
     float loss = 0;
-    std::size_t candidate_count = 0;
-    for (const auto& layer : layers) if (layer.kind == Kind::yolo)
-        candidate_count += layer.mask.size() * static_cast<std::size_t>(layer.output.h) * layer.output.w;
-    const float negative_weight = 0.5f / std::max<std::size_t>(1, candidate_count);
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const auto& layer = layers[index];
         if (layer.kind != Kind::yolo) continue;
@@ -118,8 +119,8 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
                     if (best >= layer.ignore_thresh) continue;
                 }
                 auto p = pos(anchor, 4, cell);
-                loss += negative_weight * binary_cross_entropy(output[index][p], 0.0f);
-                gradient[index][p] += negative_weight * sigmoid(output[index][p]);
+                loss += binary_cross_entropy(output[index][p], 0.0f);
+                gradient[index][p] += sigmoid(output[index][p]);
             }
         for (const auto& match : assignments[index]) {
             auto obj = pos(match.anchor, 4, match.cell);
@@ -128,15 +129,15 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
             for (int attr = 0; attr < 2; ++attr) {
                 float wanted = attr == 0 ? match.offset_x : match.offset_y;
                 auto p = pos(match.anchor, attr, match.cell);
-                loss += binary_cross_entropy(output[index][p], wanted);
-                gradient[index][p] += sigmoid(output[index][p]) - wanted;
+                loss += match.box_scale * binary_cross_entropy(output[index][p], wanted);
+                gradient[index][p] += match.box_scale * (sigmoid(output[index][p]) - wanted);
             }
             for (int attr = 2; attr < 4; ++attr) {
                 float wanted = attr == 2 ? match.log_width : match.log_height;
                 auto p = pos(match.anchor, attr, match.cell);
                 float error = output[index][p] - wanted;
-                loss += 0.5f * error * error;
-                gradient[index][p] += error;
+                loss += 0.5f * match.box_scale * error * error;
+                gradient[index][p] += match.box_scale * error;
             }
             for (int cls = 0; cls < layer.classes; ++cls) {
                 float wanted = cls == match.class_id ? 1.0f : 0.0f;
@@ -146,12 +147,8 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
             }
         }
     }
-    const float normalizer = static_cast<float>(std::max<std::size_t>(1, targets.size()));
-    loss /= normalizer;
-    for (std::size_t index = 0; index < layers.size(); ++index) {
-        if (layers[index].kind != Kind::yolo) continue;
-        for (auto& value : gradient[index]) value /= normalizer;
-    }
+    // No per-target normalization (matching Darknet: every target's full-scale delta is summed
+    // as-is; only the trainer's SGD update averages across the minibatch).
     std::size_t positives = targets.size();
     return {loss, positives};
 }

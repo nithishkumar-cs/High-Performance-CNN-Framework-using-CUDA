@@ -10,16 +10,17 @@ namespace detector {
 // batch-norm, route, upsample and YOLO heads, with true minibatch batch-norm statistics (mean/
 // variance computed across every sample passed to step(), not per sample) and the same
 // LearningRateSchedule. Convolution/batch-norm/shortcut/route/upsample forward and backward, and
-// the SGD update, run as CUDA kernels; only the YOLO heads' small output/gradient tensors are
-// copied to/from the host each step, where yolo_loss_and_gradient (shared with Trainer) does the
-// anchor assignment and loss so both backends use identical math. Device buffers are sized for
-// `batch_size` samples; step() may be called with between 1 and `batch_size` samples (a smaller
-// final partial batch is fine). Call sync_to_network() before Network::save_weights() to copy
-// the learned weights back to host.
+// the SGD update (with the same classic-momentum formula as Trainer: per-parameter velocity
+// buffers, zero-initialized, persisting across step() calls), run as CUDA kernels; only the YOLO
+// heads' small output/gradient tensors are copied to/from the host each step, where
+// yolo_loss_and_gradient (shared with Trainer) does the anchor assignment and loss so both
+// backends use identical math. Device buffers are sized for `batch_size` samples; step() may be
+// called with between 1 and `batch_size` samples (a smaller final partial batch is fine). Call
+// sync_to_network() before Network::save_weights() to copy the learned weights back to host.
 class CudaTrainer {
 public:
     explicit CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size = 1,
-                          float weight_decay = 0.0005f, float bn_momentum = 0.99f);
+                          float weight_decay = 0.0005f, float momentum = 0.9f, float bn_momentum = 0.99f);
     ~CudaTrainer();
     CudaTrainer(const CudaTrainer&) = delete;
     CudaTrainer& operator=(const CudaTrainer&) = delete;

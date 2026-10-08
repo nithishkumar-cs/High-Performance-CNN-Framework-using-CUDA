@@ -67,18 +67,23 @@ float LearningRateSchedule::at(int iteration) const {
     return lr;
 }
 
-Trainer::Trainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay, float bn_momentum)
+Trainer::Trainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay,
+                  float momentum, float bn_momentum)
     : network_(network), schedule_(std::move(schedule)), batch_size_(batch_size), weight_decay_(weight_decay),
-      bn_momentum_(bn_momentum) {
+      momentum_(momentum), bn_momentum_(bn_momentum) {
     if (!std::isfinite(schedule_.base_lr) || schedule_.base_lr <= 0 || schedule_.burn_in < 0 ||
         schedule_.steps.size() != schedule_.scales.size())
         throw std::runtime_error("invalid learning rate schedule");
     if (!std::isfinite(weight_decay) || weight_decay < 0) throw std::runtime_error("invalid weight decay");
     if (batch_size < 1) throw std::runtime_error("invalid batch size");
+    if (!std::isfinite(momentum) || momentum < 0 || momentum >= 1) throw std::runtime_error("invalid momentum");
     if (!std::isfinite(bn_momentum) || bn_momentum <= 0 || bn_momentum >= 1) throw std::runtime_error("invalid batch-norm momentum");
     weight_grad_.resize(network_.layers_.size());
     bias_grad_.resize(network_.layers_.size());
     scale_grad_.resize(network_.layers_.size());
+    weight_velocity_.resize(network_.layers_.size());
+    bias_velocity_.resize(network_.layers_.size());
+    scale_velocity_.resize(network_.layers_.size());
 }
 
 TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
@@ -393,22 +398,35 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
         }
     }
 
+    // SGD with classic momentum: velocity = momentum*velocity + this step's averaged gradient
+    // (plus weight decay for weights), then param -= lr*velocity. Velocity buffers persist
+    // across step() calls and start at zero, so the first call on a fresh Trainer is identical
+    // to plain SGD regardless of `momentum_`.
     float lr = schedule_.at(iteration_);
     float inv_n = 1.0f / static_cast<float>(n);
     for (std::size_t index = 0; index < num_layers; ++index) {
         auto& layer = layers[index];
         if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
+        if (weight_velocity_[index].empty()) weight_velocity_[index].assign(layer.weights.size(), 0.0f);
+        if (bias_velocity_[index].empty()) bias_velocity_[index].assign(layer.biases.size(), 0.0f);
         for (std::size_t p = 0; p < layer.weights.size(); ++p) {
-            layer.weights[p] -= lr * (weight_grad_[index][p] * inv_n + weight_decay_ * layer.weights[p]);
+            float& v = weight_velocity_[index][p];
+            v = momentum_ * v + weight_grad_[index][p] * inv_n + weight_decay_ * layer.weights[p];
+            layer.weights[p] -= lr * v;
             weight_grad_[index][p] = 0.0f;
         }
         for (std::size_t p = 0; p < layer.biases.size(); ++p) {
-            layer.biases[p] -= lr * bias_grad_[index][p] * inv_n;
+            float& v = bias_velocity_[index][p];
+            v = momentum_ * v + bias_grad_[index][p] * inv_n;
+            layer.biases[p] -= lr * v;
             bias_grad_[index][p] = 0.0f;
         }
         if (layer.batch_normalize) {
+            if (scale_velocity_[index].empty()) scale_velocity_[index].assign(scale_grad_[index].size(), 0.0f);
             for (std::size_t p = 0; p < scale_grad_[index].size(); ++p) {
-                layer.scales[p] -= lr * scale_grad_[index][p] * inv_n;
+                float& v = scale_velocity_[index][p];
+                v = momentum_ * v + scale_grad_[index][p] * inv_n;
+                layer.scales[p] -= lr * v;
                 scale_grad_[index][p] = 0.0f;
             }
         }

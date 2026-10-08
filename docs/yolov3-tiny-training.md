@@ -1,6 +1,6 @@
 # YOLOv3-tiny training on VOC2007
 
-This workflow trains the **actual two-head YOLOv3-tiny architecture** with the original [pjreddie/darknet](https://github.com/pjreddie/darknet) GPU trainer as an external tool. This repository's independently written C++/CUDA engine then loads, runs, and evaluates the Darknet-format weights. The experimental `cuda_detector_train` is a separate small-graph CPU trainer; it did **not** train this model and does not reproduce Darknet's optimizer, augmentation, or YOLO loss.
+This page records the historical baseline trained with the original [pjreddie/darknet](https://github.com/pjreddie/darknet) GPU trainer. The independently written C++/CUDA framework also trains YOLOv3-tiny on the laptop GPU. Its 71-epoch run initialized from the official COCO backbone reached 0.25712 VOC2007 validation mAP@0.5, compared with 0.57612 for the external-Darknet checkpoint on the same 501 images and native evaluator. The native trainer still differs in optimizer, augmentation, and parts of the YOLO loss. A later correction to background objectness weighting has passed smoke tests but has not yet had a full retrain; short fine-tuning of the older checkpoint with the new weighting reduced validation mAP, so the correction's effect on training from the start remains unmeasured.
 
 ## Provenance and attribution
 
@@ -73,4 +73,3 @@ The selected final model was evaluated once on all 4,952 untouched test images: 
 This is **not** the official VOC metric: the converted labels omit `difficult` objects, but this evaluator has no ignore-region logic, so detections on those objects may count as false positives. It also uses all-point AP rather than VOC2007's 11-point convention. It must not be presented as COCO mAP@[.5:.95] or compared directly with published VOC numbers.
 
 On Jetson Orin at its existing 25W setting, the final model's 416x416 native CUDA benchmark used five warmups and 30 timed iterations on the same PPM image as the earlier inference baseline. Mean network-forward time was **91.204 ms** (p50 91.154, p95 91.428); the mean in-memory pipeline time was **100.786 ms** (p50 100.918, p95 101.076). The pipeline includes letterbox, forward, decode, NMS, and inverse letterbox; both timings exclude image file I/O, config/weight loading, and CUDA session creation. Do not infer an end-to-end camera frame rate or a speedup over original Darknet from these timings.
-

@@ -13,6 +13,7 @@ void expect(bool condition, const char* message) {
 
 }  // namespace
 
+// Exercise detector training, batch-normalization gradients, and YOLO loss invariants.
 int main() {
     try {
         auto directory = std::filesystem::path(__FILE__).parent_path();
@@ -193,6 +194,82 @@ int main() {
             expect(grad_disabled[yolo_index][(0 * 6 + 4) * 16 + 5] != 0.0f, "disabled ignore_thresh unexpectedly suppressed the negative gradient");
         }
 
+        // Every unmatched box with a 0.5 objectness prediction needs a 0.5 gradient, even
+        // when the head contains many candidates. Otherwise background learning vanishes as
+        // the input resolution or number of YOLO heads grows.
+        {
+            auto background_net = detector::Network::from_cfg((directory / "ignore-thresh.cfg").string());
+            std::vector<std::vector<float>> output(background_net.layers().size());
+            std::vector<std::vector<float>> gradient(background_net.layers().size());
+            output[1].assign(12 * 16, 0.0f);
+            gradient[1].assign(12 * 16, 0.0f);
+            yolo_loss_and_gradient(background_net, {}, output, gradient);
+            expect(std::abs(gradient[1][(0 * 6 + 4) * 16] - 0.5f) < 1e-6f,
+                   "background gradient was diluted by candidate count");
+            expect(std::abs(gradient[1][(1 * 6 + 4) * 16 + 15] - 0.5f) < 1e-6f,
+                   "background gradient differs across unmatched anchors");
+        }
+
+        // Darknet's (2 - truth.w*truth.h) box scale applies only to matched x/y/w/h loss, not
+        // objectness/class. cx=cy=0 forces both offset targets to exactly 0 regardless of which
+        // anchor/cell gets assigned, so the unscaled x/y gradient is exactly sigmoid(0)-0=0.5 and
+        // any deviation from 0.5*box_scale isolates a missing or wrong scale factor.
+        {
+            auto scale_net = detector::Network::from_cfg((directory / "ignore-thresh.cfg").string());
+            std::vector<std::vector<float>> output(scale_net.layers().size());
+            std::vector<std::vector<float>> gradient(scale_net.layers().size());
+            output[1].assign(12 * 16, 0.0f);
+            gradient[1].assign(12 * 16, 0.0f);
+            const float width = 0.5f, height = 0.4f;
+            const float box_scale = 2.0f - width * height;
+            std::vector<detector::Target> scale_targets{{0, 0.0f, 0.0f, width, height}};
+            yolo_loss_and_gradient(scale_net, scale_targets, output, gradient);
+            const std::size_t attrs = 6, area = 16;
+            int match_anchor = -1;
+            for (int a = 0; a < 2 && match_anchor < 0; ++a)
+                if (std::abs(gradient[1][(static_cast<std::size_t>(a) * attrs + 4) * area] + 0.5f) < 1e-6f) match_anchor = a;
+            expect(match_anchor >= 0, "no matched anchor found at cell 0 for box-scale test");
+            float offset_x_grad = gradient[1][(static_cast<std::size_t>(match_anchor) * attrs + 0) * area];
+            float offset_y_grad = gradient[1][(static_cast<std::size_t>(match_anchor) * attrs + 1) * area];
+            expect(std::abs(offset_x_grad - 0.5f * box_scale) < 1e-5f, "x offset gradient missing Darknet's (2-area) box scale");
+            expect(std::abs(offset_y_grad - 0.5f * box_scale) < 1e-5f, "y offset gradient missing Darknet's (2-area) box scale");
+        }
+
+        // SGD momentum: velocity starts at zero, so a trainer's first step() is identical to
+        // plain SGD regardless of `momentum`, letting the first step recover g1 (the raw
+        // gradient) from its own weight delta. The second step must then differ from a
+        // momentum=0 trainer's by exactly lr*momentum*g1 (the carried-over velocity term).
+        {
+            auto momentum_cfg = (directory / "train-mini.cfg").string();
+            std::vector<float> m_input{1.0f, 0.5f, 0.25f};
+            std::vector<detector::Target> m_targets{{0, 0.5f, 0.5f, 0.5f, 0.5f}};
+            const float lr = 0.01f;
+
+            auto net0 = detector::Network::from_cfg(momentum_cfg);
+            net0.initialize_random(3);
+            detector::Trainer t0(net0, detector::LearningRateSchedule{lr}, 1, 0.0f, 0.0f);
+            float w_initial = net0.layer(0).weights[0];
+            t0.step({m_input}, {m_targets});
+            float w_after1 = net0.layer(0).weights[0];
+            t0.step({m_input}, {m_targets});
+            float w0_after2 = net0.layer(0).weights[0];
+
+            auto netm = detector::Network::from_cfg(momentum_cfg);
+            netm.initialize_random(3);
+            detector::Trainer tm(netm, detector::LearningRateSchedule{lr}, 1, 0.0f, 0.9f);
+            tm.step({m_input}, {m_targets});
+            float wm_after1 = netm.layer(0).weights[0];
+            tm.step({m_input}, {m_targets});
+            float wm_after2 = netm.layer(0).weights[0];
+
+            expect(std::abs(w_after1 - wm_after1) < 1e-7f, "first momentum step must match plain SGD (zero initial velocity)");
+            float g1 = (w_initial - w_after1) / lr;
+            float expected_extra = lr * 0.9f * g1;
+            float actual_extra = w0_after2 - wm_after2;
+            expect(std::abs(actual_extra - expected_extra) < 1e-4f * std::max(1.0f, std::abs(expected_extra)),
+                   "momentum did not carry velocity between steps as expected");
+        }
+
         std::cout << "training smoke passed: first=" << first << " last=" << last << '\n';
         return 0;
     } catch (const std::exception& error) {
@@ -200,5 +277,3 @@ int main() {
         return 1;
     }
 }
-
-

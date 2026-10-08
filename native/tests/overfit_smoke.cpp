@@ -64,7 +64,10 @@ int main() {
             const float cx = 0.625f, cy = 0.625f, w = 0.4f, h = 0.4f;
             std::vector<detector::Target> targets{{0, cx, cy, w, h}};
 
-            detector::Trainer trainer(network, detector::LearningRateSchedule{0.1f}, 1, 0.0f);
+            // LR scaled down by (1-momentum) from the pre-momentum 0.1: momentum's default 0.9
+            // amplifies steady-state step size by ~1/(1-momentum), so this keeps a comparable
+            // effective step size instead of diverging.
+            detector::Trainer trainer(network, detector::LearningRateSchedule{0.01f}, 1, 0.0f);
             for (int i = 0; i < 6000; ++i) trainer.step({input}, {targets});
 
             auto heads = network.forward(input, detector::Backend::cpu);
@@ -94,7 +97,8 @@ int main() {
             detector::Target large{15, 0.7f, 0.6f, 44.0f / 64, 50.0f / 64};
             std::vector<detector::Target> targets{small, large};
 
-            detector::Trainer trainer(network, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
+            // Same (1-momentum) scaling as scenario 1's LR, see comment there.
+            detector::Trainer trainer(network, detector::LearningRateSchedule{0.005f}, 1, 0.0f);
             for (int i = 0; i < 4000; ++i) trainer.step({input}, {targets});
 
             auto heads = network.forward(input, detector::Backend::cpu);

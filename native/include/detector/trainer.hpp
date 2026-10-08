@@ -34,18 +34,21 @@ struct LearningRateSchedule {
 
 // CPU reference trainer for the cfg layer subset supported by Network, including shortcut
 // (residual-add) branches. Convolution weights/biases and, for batch_normalize layers, the
-// scale (gamma) and bias (beta) all receive SGD updates. step() takes a true minibatch (one
-// input/target-list per sample): batch-norm mean/variance are computed across every sample in
-// the call (and each channel's spatial H*W positions), matching Darknet's batched statistics
-// rather than per-sample ones, and the running mean/variance used by inference are updated by
-// exponential moving average from those batch statistics once per call. Every step() call
-// applies one SGD update averaged over its samples; `batch_size` only bounds how many samples a
-// call may hold (a final, smaller partial batch is fine). This is still not Darknet's exact loss
-// or augmentation pipeline.
+// scale (gamma) and bias (beta) all receive SGD updates with classic momentum: a velocity buffer
+// per parameter accumulates `velocity = momentum*velocity + averaged_grad(+weight_decay*param for
+// weights)`, then `param -= lr*velocity` (matching Darknet's cfg momentum=0.9 default; velocity
+// starts at zero so a trainer's very first step() call is unaffected by `momentum`). step() takes
+// a true minibatch (one input/target-list per sample): batch-norm mean/variance are computed
+// across every sample in the call (and each channel's spatial H*W positions), matching Darknet's
+// batched statistics rather than per-sample ones, and the running mean/variance used by inference
+// are updated by exponential moving average from those batch statistics once per call. Every
+// step() call applies one SGD update averaged over its samples; `batch_size` only bounds how many
+// samples a call may hold (a final, smaller partial batch is fine). This is still not Darknet's
+// exact loss or augmentation pipeline.
 class Trainer {
 public:
     explicit Trainer(Network& network, LearningRateSchedule schedule, int batch_size = 1,
-                      float weight_decay = 0.0005f, float bn_momentum = 0.99f);
+                      float weight_decay = 0.0005f, float momentum = 0.9f, float bn_momentum = 0.99f);
     // `inputs.size()` must be between 1 and the constructor's `batch_size` inclusive; `targets`
     // must have the same length, one target list per sample.
     TrainResult step(const std::vector<std::vector<float>>& inputs,
@@ -60,11 +63,15 @@ private:
     LearningRateSchedule schedule_;
     int batch_size_;
     float weight_decay_;
+    float momentum_;
     float bn_momentum_;
     int iteration_ = 0;
     std::vector<std::vector<float>> weight_grad_;
     std::vector<std::vector<float>> bias_grad_;   // beta grad when batch_normalize, else conv bias grad
     std::vector<std::vector<float>> scale_grad_;  // gamma grad, batch_normalize layers only
+    std::vector<std::vector<float>> weight_velocity_;
+    std::vector<std::vector<float>> bias_velocity_;
+    std::vector<std::vector<float>> scale_velocity_;
 };
 
 }  // namespace detector

@@ -19,9 +19,15 @@ struct YoloLossResult {
 // Negative (non-assigned) anchor/cell objectness is skipped when its decoded predicted box
 // already overlaps some target by >= that layer's ignore_thresh (cfg `[yolo]` field, default
 // 0.7): a near-miss Darknet convention keeps unpenalized rather than pushed to "background".
-// `output[i]` must hold that yolo layer's raw head values (any backend: CPU or CUDA). Both the
-// returned loss and every written gradient are normalized by max(1, targets.size()). Shared by
-// the CPU and CUDA trainers so both use identical target assignment and loss math.
+// Every remaining negative uses unit BCE weight, regardless of the number of candidates. Every
+// matched target's x/y/width/height (not objectness/class) loss and gradient are scaled by
+// Darknet's (2 - truth.w*truth.h) box scale (truth fractions of the network input), which
+// up-weights small boxes; see delta_yolo_box in pjreddie/darknet's yolo_layer.c. `output[i]` must
+// hold that yolo layer's raw head values (any backend: CPU or CUDA). Neither the returned loss
+// nor the written gradients are normalized by target count (matching Darknet, which sums every
+// target's full-scale delta regardless of how many targets share an image; batch-size averaging
+// happens once, in the trainer's SGD update). Shared by the CPU and CUDA trainers so both use
+// identical target assignment and loss math.
 YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<Target>& targets,
                                        const std::vector<std::vector<float>>& output,
                                        std::vector<std::vector<float>>& gradient);

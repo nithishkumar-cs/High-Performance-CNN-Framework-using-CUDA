@@ -21,6 +21,7 @@ struct Options {
     int limit = 0;
     float learning_rate = 0.0001f;
     float decay = 0.0005f;
+    float momentum = 0.9f;  // Darknet cfg's SGD momentum default
     std::uint32_t seed = 2026;
     std::string initial_weights;
     int init_layers = -1;  // -1: full load of initial_weights; >=0: partial/pretrained-backbone load
@@ -63,6 +64,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--limit") options.limit = std::stoi(value);
         else if (key == "--lr") options.learning_rate = std::stof(value);
         else if (key == "--decay") options.decay = std::stof(value);
+        else if (key == "--momentum") options.momentum = std::stof(value);
         else if (key == "--seed") options.seed = static_cast<std::uint32_t>(std::stoul(value));
         else if (key == "--init") options.initial_weights = value;
         else if (key == "--init-layers") options.init_layers = std::stoi(value);
@@ -298,7 +300,7 @@ int main(int argc, char** argv) {
     try {
         if (argc < 5) {
             std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
-                         "[--init weights] [--init-layers N] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--seed 2026] [--limit N] "
+                         "[--init weights] [--init-layers N] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--momentum 0.9] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
                          "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
                          "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda]\n";
@@ -330,16 +332,16 @@ int main(int argc, char** argv) {
                   << " exposure_jitter=" << options.exposure_jitter
                   << " saturation_jitter=" << options.saturation_jitter
                   << " hue_jitter=" << options.hue_jitter
-                  << " crop_jitter=" << options.crop_jitter << "\n";
+                  << " crop_jitter=" << options.crop_jitter << " momentum=" << options.momentum << "\n";
         if (options.backend == "cuda") {
 #ifdef DETECTOR_HAS_CUDA
-            detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay);
+            detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay, options.momentum);
             train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/true);
 #else
             throw std::runtime_error("--backend cuda requires a build with -DDETECTOR_CUDA=ON");
 #endif
         } else {
-            detector::Trainer trainer(network, schedule, options.batch_size, options.decay);
+            detector::Trainer trainer(network, schedule, options.batch_size, options.decay, options.momentum);
             train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/false);
         }
         return 0;

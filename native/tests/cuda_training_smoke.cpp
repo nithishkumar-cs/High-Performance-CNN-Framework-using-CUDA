@@ -107,8 +107,12 @@ void check_parity_batch(const std::string& cfg,
     auto gpu_net = detector::Network::from_cfg(cfg);
     gpu_net.initialize_random(17);
     int batch_size = static_cast<int>(samples.size());
-    detector::Trainer cpu_trainer(cpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
-    detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.05f}, batch_size, 0.0005f);
+    // Lower LR than check_parity's 0.05: SGD momentum's default 0.9 (~10x effective step size)
+    // diverges this tiny two-distinct-sample batch-norm graph at 0.05 within 5 steps (CPU and
+    // GPU still matched each other exactly while diverging, so this is a test-tuning issue, not
+    // a parity bug); 0.01 keeps the same real momentum code path numerically stable.
+    detector::Trainer cpu_trainer(cpu_net, detector::LearningRateSchedule{0.01f}, batch_size, 0.0005f);
+    detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.01f}, batch_size, 0.0005f);
     std::vector<std::vector<float>> inputs;
     std::vector<std::vector<detector::Target>> targets;
     for (const auto& sample : samples) { inputs.push_back(sample.first); targets.push_back(sample.second); }

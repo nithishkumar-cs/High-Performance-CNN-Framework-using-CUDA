@@ -299,15 +299,25 @@ __global__ void add_into(float* dst, const float* src, int count) {
     if (pos < count) dst[pos] += src[pos];
 }
 
-__global__ void sgd_apply(float* param, const float* grad_accum, int count, float lr, float inv_batch) {
+// Classic SGD momentum: velocity = momentum*velocity + this step's averaged gradient (plus
+// weight decay for weights), then param -= lr*velocity. `velocity` persists across calls and
+// starts zeroed, so the first call is identical to plain SGD regardless of `momentum`.
+__global__ void sgd_apply_momentum(float* param, const float* grad_accum, float* velocity, int count,
+                                   float lr, float inv_batch, float momentum) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos < count) param[pos] -= lr * grad_accum[pos] * inv_batch;
+    if (pos >= count) return;
+    float v = momentum * velocity[pos] + grad_accum[pos] * inv_batch;
+    velocity[pos] = v;
+    param[pos] -= lr * v;
 }
 
-__global__ void sgd_apply_with_decay(float* param, const float* grad_accum, int count, float lr,
-                                     float inv_batch, float decay) {
+__global__ void sgd_apply_with_decay_momentum(float* param, const float* grad_accum, float* velocity, int count,
+                                              float lr, float inv_batch, float decay, float momentum) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
-    if (pos < count) param[pos] -= lr * (grad_accum[pos] * inv_batch + decay * param[pos]);
+    if (pos >= count) return;
+    float v = momentum * velocity[pos] + grad_accum[pos] * inv_batch + decay * param[pos];
+    velocity[pos] = v;
+    param[pos] -= lr * v;
 }
 
 __global__ void zero(float* buffer, int count) {
@@ -322,6 +332,7 @@ struct CudaTrainer::Impl {
     LearningRateSchedule schedule;
     int batch_size;
     float weight_decay;
+    float momentum;
     float bn_momentum;
     int iteration = 0;
     DeviceMemory memory;
@@ -330,16 +341,19 @@ struct CudaTrainer::Impl {
     std::vector<float*> raw, batch_mean, batch_var, sum_dxhat, sum_dxhat_xhat, running_mean, running_variance;
     std::vector<float*> weights, biases, scales;
     std::vector<float*> weight_grad_accum, bias_grad_accum, scale_grad_accum;
+    std::vector<float*> weight_velocity, bias_velocity, scale_velocity;
     std::vector<int*> max_index;
 
-    Impl(Network& net, LearningRateSchedule sched, int batch, float decay, float momentum)
-        : network(net), schedule(std::move(sched)), batch_size(batch), weight_decay(decay), bn_momentum(momentum) {
+    Impl(Network& net, LearningRateSchedule sched, int batch, float decay, float sgd_momentum, float bn_mom)
+        : network(net), schedule(std::move(sched)), batch_size(batch), weight_decay(decay), momentum(sgd_momentum),
+          bn_momentum(bn_mom) {
         if (!std::isfinite(schedule.base_lr) || schedule.base_lr <= 0 || schedule.burn_in < 0 ||
             schedule.steps.size() != schedule.scales.size())
             throw std::runtime_error("invalid learning rate schedule");
         if (!std::isfinite(decay) || decay < 0) throw std::runtime_error("invalid weight decay");
         if (batch < 1) throw std::runtime_error("invalid batch size");
-        if (!std::isfinite(momentum) || momentum <= 0 || momentum >= 1) throw std::runtime_error("invalid batch-norm momentum");
+        if (!std::isfinite(sgd_momentum) || sgd_momentum < 0 || sgd_momentum >= 1) throw std::runtime_error("invalid momentum");
+        if (!std::isfinite(bn_mom) || bn_mom <= 0 || bn_mom >= 1) throw std::runtime_error("invalid batch-norm momentum");
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
         if (devices < 1) throw std::runtime_error("no CUDA device available");
@@ -361,6 +375,7 @@ struct CudaTrainer::Impl {
         running_mean.resize(n, nullptr); running_variance.resize(n, nullptr);
         weights.resize(n, nullptr); biases.resize(n, nullptr); scales.resize(n, nullptr);
         weight_grad_accum.resize(n, nullptr); bias_grad_accum.resize(n, nullptr); scale_grad_accum.resize(n, nullptr);
+        weight_velocity.resize(n, nullptr); bias_velocity.resize(n, nullptr); scale_velocity.resize(n, nullptr);
         max_index.resize(n, nullptr);
         for (std::size_t i = 0; i < n; ++i) {
             const auto& layer = layers[i];
@@ -377,6 +392,8 @@ struct CudaTrainer::Impl {
             biases[i] = memory.upload(layer.biases);
             weight_grad_accum[i] = memory.floats(layer.weights.size());
             bias_grad_accum[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
+            weight_velocity[i] = memory.floats(layer.weights.size());
+            bias_velocity[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
             if (layer.batch_normalize) {
                 if (layer.scales.size() != static_cast<std::size_t>(layer.output.c) ||
                     layer.means.size() != static_cast<std::size_t>(layer.output.c) ||
@@ -389,6 +406,7 @@ struct CudaTrainer::Impl {
                 sum_dxhat_xhat[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 scales[i] = memory.upload(layer.scales);
                 scale_grad_accum[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
+                scale_velocity[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 running_mean[i] = memory.upload(layer.means);
                 running_variance[i] = memory.upload(layer.variances);
             }
@@ -611,23 +629,27 @@ struct CudaTrainer::Impl {
             }
         }
 
-        // One SGD update, averaged over this call's n samples (every call is a full minibatch).
+        // One SGD-with-momentum update, averaged over this call's n samples (every call is a
+        // full minibatch); velocity buffers persist across calls (see sgd_apply_momentum).
         float lr = schedule.at(iteration);
         float inv_n = 1.0f / static_cast<float>(n);
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
             if (layer.kind != Kind::convolutional) continue;
             int wcount = static_cast<int>(layer.weights.size());
-            sgd_apply_with_decay<<<blocks_for(wcount), kThreads>>>(weights[i], weight_grad_accum[i], wcount, lr, inv_n, weight_decay);
+            sgd_apply_with_decay_momentum<<<blocks_for(wcount), kThreads>>>(
+                weights[i], weight_grad_accum[i], weight_velocity[i], wcount, lr, inv_n, weight_decay, momentum);
             launch_check();
-            sgd_apply<<<blocks_for(layer.output.c), kThreads>>>(biases[i], bias_grad_accum[i], layer.output.c, lr, inv_n);
+            sgd_apply_momentum<<<blocks_for(layer.output.c), kThreads>>>(
+                biases[i], bias_grad_accum[i], bias_velocity[i], layer.output.c, lr, inv_n, momentum);
             launch_check();
             zero<<<blocks_for(wcount), kThreads>>>(weight_grad_accum[i], wcount);
             launch_check();
             zero<<<blocks_for(layer.output.c), kThreads>>>(bias_grad_accum[i], layer.output.c);
             launch_check();
             if (layer.batch_normalize) {
-                sgd_apply<<<blocks_for(layer.output.c), kThreads>>>(scales[i], scale_grad_accum[i], layer.output.c, lr, inv_n);
+                sgd_apply_momentum<<<blocks_for(layer.output.c), kThreads>>>(
+                    scales[i], scale_grad_accum[i], scale_velocity[i], layer.output.c, lr, inv_n, momentum);
                 launch_check();
                 zero<<<blocks_for(layer.output.c), kThreads>>>(scale_grad_accum[i], layer.output.c);
                 launch_check();
@@ -662,8 +684,9 @@ struct CudaTrainer::Impl {
     }
 };
 
-CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay, float bn_momentum)
-    : impl_(std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, bn_momentum)) {}
+CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay,
+                          float momentum, float bn_momentum)
+    : impl_(std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, momentum, bn_momentum)) {}
 CudaTrainer::~CudaTrainer() = default;
 TrainResult CudaTrainer::step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
     return impl_->step(inputs, targets);

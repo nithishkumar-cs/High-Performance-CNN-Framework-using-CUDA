@@ -144,6 +144,23 @@ int main() {
         std::filesystem::remove(strict_weights);
         expect(full_load_threw, "full load must reject trailing data that a partial load would ignore");
 
+        // Network::resize (Darknet-style multiscale training): recomputes every layer's shape for
+        // a new input size while leaving every learned parameter untouched. mini.cfg's one maxpool
+        // (stride 2) and one upsample (stride 2) exactly cancel, so doubling 4x4 to 8x8 keeps the
+        // route layer's two branches' spatial shapes matched, just like at the original size.
+        auto resize_net = detector::Network::from_cfg(cfg.string());
+        resize_net.initialize_random(11);
+        auto layer0_weights_before = resize_net.layer(0).weights;
+        resize_net.resize(8, 8);
+        expect(resize_net.input_shape().h == 8 && resize_net.input_shape().w == 8, "resize: input shape");
+        expect(resize_net.layers()[0].output.h == 8 && resize_net.layers()[0].output.w == 8, "resize: conv0 shape");
+        expect(resize_net.layers()[1].output.h == 4 && resize_net.layers()[1].output.w == 4, "resize: maxpool shape");
+        expect(resize_net.layers()[4].output.c == 12 && resize_net.layers()[4].output.h == 8, "resize: route shape");
+        expect(resize_net.layer(0).weights == layer0_weights_before, "resize: weights untouched");
+        std::vector<float> resized_input(resize_net.input_shape().elements(), 0.25f);
+        auto resized_heads = resize_net.forward(resized_input, detector::Backend::cpu);
+        expect(resized_heads.size() == 1 && resized_heads[0].values.size() == 6 * 8 * 8, "resize: forward output shape");
+
         std::cout << "detector smoke tests passed\n";
         return 0;
     } catch (const std::exception& error) {

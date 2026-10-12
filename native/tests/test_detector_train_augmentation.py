@@ -1,8 +1,10 @@
-"""Exercise the detector CLI's crop/hue/saturation/exposure/flip augmentation pipeline end to end:
-writes tiny synthetic images+labels, trains a few steps with every jitter flag enabled, and checks
-training completes with a finite loss and a saved checkpoint (a regression test for the crop/HSV
-augmentation added alongside ignore_thresh - it does not assert accuracy, only that the augmented
-data pipeline runs and keeps producing valid, finite training signal)."""
+"""Exercise the detector CLI's crop/hue/saturation/exposure/flip/multiscale augmentation pipeline
+end to end: writes tiny synthetic images+labels, trains a few steps with every jitter flag (and
+Darknet-style multiscale resize) enabled, and checks training completes with a finite loss and a
+saved checkpoint (a regression test for the crop/HSV augmentation added alongside ignore_thresh,
+and for the later --multiscale-min/--multiscale-max/--multiscale-interval resize-jitter support -
+it does not assert accuracy, only that the augmented/resizing data pipeline runs end to end and
+keeps producing valid, finite training signal)."""
 from __future__ import annotations
 
 import pathlib
@@ -48,6 +50,10 @@ def main() -> None:
             "--epochs", 2, "--lr", 0.001, "--batch", 1,
             "--flip-probability", 0.5, "--exposure-jitter", 0.3,
             "--saturation-jitter", 0.3, "--hue-jitter", 0.1, "--crop-jitter", 0.2,
+            # mini.cfg's one maxpool (stride 2) and one upsample (stride 2) cancel at any even
+            # size, so resizing within [32,64] stays structurally valid; interval=1 forces a
+            # resize after every single-image batch so both sizes are actually exercised.
+            "--multiscale-min", 32, "--multiscale-max", 64, "--multiscale-interval", 1,
         )
         if "epoch=2" not in output or not weights.is_file():
             raise AssertionError(f"augmented training did not complete: {output}")

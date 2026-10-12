@@ -2,6 +2,7 @@
 #ifdef DETECTOR_HAS_CUDA
 #include "detector/yolo_loss.hpp"
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -37,6 +38,28 @@ struct DeviceMemory {
         float* pointer = floats(host.size());
         check(cudaMemcpy(pointer, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
         return pointer;
+    }
+    // Frees `existing` (if non-null) and replaces it with a fresh zeroed buffer of `count`
+    // elements, for multiscale resize: only the spatial-dimension-sized activation/gradient
+    // buffers need this; per-channel buffers (weights, BN stats, velocities) are untouched by a
+    // resize since channel counts never change.
+    void replace(float*& existing, std::size_t count) {
+        if (existing) {
+            auto it = std::find(allocations.begin(), allocations.end(), static_cast<void*>(existing));
+            if (it != allocations.end()) allocations.erase(it);
+            cudaFree(existing);
+            existing = nullptr;
+        }
+        existing = floats(count);
+    }
+    void replace(int*& existing, std::size_t count) {
+        if (existing) {
+            auto it = std::find(allocations.begin(), allocations.end(), static_cast<void*>(existing));
+            if (it != allocations.end()) allocations.erase(it);
+            cudaFree(existing);
+            existing = nullptr;
+        }
+        existing = ints(count);
     }
 };
 
@@ -413,6 +436,30 @@ struct CudaTrainer::Impl {
         }
     }
 
+    // Darknet-style multiscale resize: recomputes every layer's shape on `network` for a new
+    // input width/height, then reallocates only the spatial-dimension-sized buffers (input,
+    // per-layer output/gradient/preactivation/raw, maxpool's max_index) at the new size. Every
+    // per-channel buffer (weights, biases, scales, BN running stats, SGD velocities, gradient
+    // accumulators) is untouched - resizing never changes a layer's channel count, only its
+    // spatial extent - so learned parameters and momentum/BN state survive the resize exactly
+    // like Darknet's own resize_network, unlike a destroy-and-reconstruct approach would.
+    void resize(int width, int height) {
+        network.resize(width, height);
+        const auto& layers = network.layers();
+        memory.replace(input, static_cast<std::size_t>(batch_size) * network.input_shape().elements());
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& layer = layers[i];
+            std::size_t elems = static_cast<std::size_t>(batch_size) * layer.output.elements();
+            memory.replace(output[i], elems);
+            memory.replace(gradient[i], elems);
+            if (layer.kind == Kind::maxpool) { memory.replace(max_index[i], elems); continue; }
+            if (layer.kind == Kind::shortcut) { memory.replace(preactivation[i], elems); continue; }
+            if (layer.kind != Kind::convolutional) continue;
+            memory.replace(preactivation[i], elems);
+            if (layer.batch_normalize) memory.replace(raw[i], elems);
+        }
+    }
+
     // `inputs.size()` (== n) must be between 1 and `batch_size`; device buffers are sample-major
     // blocks of `batch_size` capacity, so this uses only their first n blocks.
     TrainResult step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
@@ -693,6 +740,7 @@ TrainResult CudaTrainer::step(const std::vector<std::vector<float>>& inputs, con
 }
 float CudaTrainer::current_learning_rate() const { return impl_->current_learning_rate(); }
 void CudaTrainer::sync_to_network() { impl_->sync_to_network(); }
+void CudaTrainer::resize(int width, int height) { impl_->resize(width, height); }
 
 }  // namespace detector
 #endif

@@ -36,6 +36,12 @@ struct Options {
     float hue_jitter = 0.0f;         // max hue shift as a fraction of the full circle, e.g. 0.1 => +-36 degrees
     float crop_jitter = 0.0f;        // max fraction of width/height cropped from each edge before letterboxing
     std::string backend = "cpu";
+    // Darknet-style multiscale/resize-jitter training: every `multiscale_interval` completed
+    // minibatches, resize the network to a new square dimension, a random multiple of 32 in
+    // [multiscale_min, multiscale_max]. Disabled (default) when multiscale_max is 0.
+    int multiscale_min = 0;
+    int multiscale_max = 0;
+    int multiscale_interval = 10;  // Darknet's default resize period, in batches
 };
 
 std::vector<int> int_list(const std::string& value) {
@@ -78,6 +84,9 @@ Options options_from(int argc, char** argv) {
         else if (key == "--hue-jitter") options.hue_jitter = std::stof(value);
         else if (key == "--crop-jitter") options.crop_jitter = std::stof(value);
         else if (key == "--backend") options.backend = value;
+        else if (key == "--multiscale-min") options.multiscale_min = std::stoi(value);
+        else if (key == "--multiscale-max") options.multiscale_max = std::stoi(value);
+        else if (key == "--multiscale-interval") options.multiscale_interval = std::stoi(value);
         else throw std::runtime_error("unknown option: " + key);
     }
     if (options.epochs < 1 || options.epochs > 100000 || options.limit < 0)
@@ -99,6 +108,12 @@ Options options_from(int argc, char** argv) {
         throw std::runtime_error("invalid crop jitter");
     if (options.backend != "cpu" && options.backend != "cuda")
         throw std::runtime_error("--backend must be cpu or cuda");
+    if (options.multiscale_min != 0 || options.multiscale_max != 0) {
+        if (options.multiscale_min <= 0 || options.multiscale_max <= 0 || options.multiscale_min > options.multiscale_max ||
+            options.multiscale_min % 32 != 0 || options.multiscale_max % 32 != 0)
+            throw std::runtime_error("--multiscale-min/--multiscale-max must be positive multiples of 32 with min <= max");
+    }
+    if (options.multiscale_interval < 1) throw std::runtime_error("invalid multiscale interval");
     return options;
 }
 
@@ -232,6 +247,12 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
     std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
     std::uniform_real_distribution<float> saturation_dist(1.0f - options.saturation_jitter, 1.0f + options.saturation_jitter);
     std::uniform_real_distribution<float> hue_dist(-options.hue_jitter, options.hue_jitter);
+    // Multiscale resize-jitter: a single random multiple-of-32 dimension applied to both width
+    // and height (Darknet always resizes to a square), persisting across epochs since the batch
+    // counter below is declared once for the whole run, not reset per epoch.
+    bool multiscale = options.multiscale_max > 0;
+    std::uniform_int_distribution<int> multiscale_dist(options.multiscale_min / 32, options.multiscale_max / 32);
+    int batches_done = 0;
     for (int epoch = 1; epoch <= options.epochs; ++epoch) {
         std::shuffle(images.begin(), images.end(), rng);
         double loss_sum = 0;
@@ -245,6 +266,10 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
             positives += result.positives;
             batch_inputs.clear();
             batch_targets.clear();
+            if (multiscale && ++batches_done % options.multiscale_interval == 0) {
+                int dim = multiscale_dist(rng) * 32;
+                trainer.resize(dim, dim);
+            }
         };
         for (const auto& path : images) {
             auto image = detector::read_image(path.string());
@@ -303,7 +328,8 @@ int main(int argc, char** argv) {
                          "[--init weights] [--init-layers N] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--momentum 0.9] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
                          "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
-                         "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda]\n";
+                         "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda] "
+                         "[--multiscale-min N] [--multiscale-max N] [--multiscale-interval 10]\n";
             return 2;
         }
         auto options = options_from(argc, argv);
@@ -332,7 +358,9 @@ int main(int argc, char** argv) {
                   << " exposure_jitter=" << options.exposure_jitter
                   << " saturation_jitter=" << options.saturation_jitter
                   << " hue_jitter=" << options.hue_jitter
-                  << " crop_jitter=" << options.crop_jitter << " momentum=" << options.momentum << "\n";
+                  << " crop_jitter=" << options.crop_jitter << " momentum=" << options.momentum
+                  << " multiscale_min=" << options.multiscale_min << " multiscale_max=" << options.multiscale_max
+                  << " multiscale_interval=" << options.multiscale_interval << "\n";
         if (options.backend == "cuda") {
 #ifdef DETECTOR_HAS_CUDA
             detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay, options.momentum);

@@ -94,6 +94,53 @@ void positive(int x, const char* name) {
     if (x <= 0 || x > 8192) throw std::runtime_error(std::string("invalid ") + name);
 }
 
+// Computes one layer's output Shape from its already-populated kind-specific fields (filters,
+// size, stride, padding, mask, classes, sources - whichever the kind needs) and the current
+// running `shape`. route/shortcut resolve branch shapes from `layers_so_far`, whose entries at
+// every index in `layer.sources` are always earlier (already-finalized) layers. Shared by
+// Network::from_cfg (initial shape derivation while parsing) and Network::resize (recomputing
+// every shape for a new input width/height, e.g. Darknet-style multiscale training) so the two
+// can never silently diverge.
+Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Layer>& layers_so_far) {
+    switch (layer.kind) {
+    case Kind::convolutional: {
+        int nh = shape.h + 2 * layer.padding - layer.size;
+        int nw = shape.w + 2 * layer.padding - layer.size;
+        if (nh < 0 || nw < 0) throw std::runtime_error("convolution filter exceeds input");
+        return {layer.filters, nh / layer.stride + 1, nw / layer.stride + 1};
+    }
+    case Kind::maxpool:
+        return {shape.c, (shape.h - 1) / layer.stride + 1, (shape.w - 1) / layer.stride + 1};
+    case Kind::route: {
+        int channels = 0;
+        for (int resolved : layer.sources) {
+            const Shape& branch = layers_so_far.at(static_cast<std::size_t>(resolved)).output;
+            if (branch.h != shape.h || branch.w != shape.w) throw std::runtime_error("route spatial shapes differ");
+            channels += branch.c;
+        }
+        return {channels, shape.h, shape.w};
+    }
+    case Kind::upsample:
+        return {shape.c, shape.h * layer.stride, shape.w * layer.stride};
+    case Kind::shortcut: {
+        const Shape& branch = layers_so_far.at(static_cast<std::size_t>(layer.sources.at(0))).output;
+        if (branch.c != shape.c || branch.h != shape.h || branch.w != shape.w)
+            throw std::runtime_error("shortcut requires matching input/branch shape (no channel projection)");
+        return shape;
+    }
+    case Kind::connected:
+        return {layer.filters, 1, 1};
+    case Kind::softmax:
+        if (shape.h != 1 || shape.w != 1) throw std::runtime_error("[softmax] requires vector input");
+        return shape;
+    case Kind::yolo:
+        if (shape.c != static_cast<int>(layer.mask.size()) * (layer.classes + 5))
+            throw std::runtime_error("yolo channels must equal mask count * (classes + 5)");
+        return shape;
+    }
+    throw std::runtime_error("unsupported layer kind");
+}
+
 template <typename T> void read_scalar(std::ifstream& file, T& value) {
     if (!file.read(reinterpret_cast<char*>(&value), sizeof(T))) throw std::runtime_error("truncated Darknet weights header");
 }
@@ -244,46 +291,31 @@ Network Network::from_cfg(const std::string& path) {
             auto activation = option(section, "activation", "linear");
             if (activation != "linear" && activation != "leaky") throw std::runtime_error("unsupported activation: " + activation);
             layer.leaky = activation == "leaky";
-            int nh = shape.h + 2 * layer.padding - layer.size;
-            int nw = shape.w + 2 * layer.padding - layer.size;
-            if (nh < 0 || nw < 0) throw std::runtime_error("convolution filter exceeds input");
-            layer.output = {layer.filters, nh / layer.stride + 1, nw / layer.stride + 1};
         } else if (section.name == "maxpool") {
             layer.kind = Kind::maxpool;
             layer.size = integer(section, "size");
             layer.stride = integer(section, "stride");
             positive(layer.size, "size"); positive(layer.stride, "stride");
-            layer.output = {shape.c, (shape.h - 1) / layer.stride + 1, (shape.w - 1) / layer.stride + 1};
         } else if (section.name == "route") {
             layer.kind = Kind::route;
-            int channels = 0;
             for (int raw : list(section, "layers")) {
                 int resolved = raw < 0 ? static_cast<int>(net.layers_.size()) + raw : raw;
                 if (resolved < 0 || resolved >= static_cast<int>(net.layers_.size())) throw std::runtime_error("route references missing layer");
-                Shape branch = net.layers_[static_cast<std::size_t>(resolved)].output;
-                if (branch.h != shape.h || branch.w != shape.w) throw std::runtime_error("route spatial shapes differ");
-                channels += branch.c;
                 layer.sources.push_back(resolved);
             }
-            layer.output = {channels, shape.h, shape.w};
         } else if (section.name == "upsample") {
             layer.kind = Kind::upsample;
             layer.stride = integer(section, "stride");
             positive(layer.stride, "upsample stride");
-            layer.output = {shape.c, shape.h * layer.stride, shape.w * layer.stride};
         } else if (section.name == "shortcut") {
             layer.kind = Kind::shortcut;
             int from = integer(section, "from");
             int resolved = from < 0 ? static_cast<int>(net.layers_.size()) + from : from;
             if (resolved < 0 || resolved >= static_cast<int>(net.layers_.size())) throw std::runtime_error("shortcut references missing layer");
-            Shape branch = net.layers_[static_cast<std::size_t>(resolved)].output;
-            if (branch.c != shape.c || branch.h != shape.h || branch.w != shape.w)
-                throw std::runtime_error("shortcut requires matching input/branch shape (no channel projection)");
             auto activation = option(section, "activation", "linear");
             if (activation != "linear" && activation != "leaky") throw std::runtime_error("unsupported shortcut activation: " + activation);
             layer.leaky = activation == "leaky";
             layer.sources.push_back(resolved);
-            layer.output = shape;
         } else if (section.name == "connected") {
             layer.kind = Kind::connected;
             layer.filters = integer(section, "output");
@@ -292,12 +324,9 @@ Network Network::from_cfg(const std::string& path) {
             if (activation != "linear" && activation != "leaky")
                 throw std::runtime_error("unsupported connected activation: " + activation);
             layer.leaky = activation == "leaky";
-            layer.output = {layer.filters, 1, 1};
         } else if (section.name == "softmax") {
             layer.kind = Kind::softmax;
-            if (shape.h != 1 || shape.w != 1 || i + 1 != sections.size())
-                throw std::runtime_error("[softmax] requires vector input and must be the final layer");
-            layer.output = shape;
+            if (i + 1 != sections.size()) throw std::runtime_error("[softmax] must be the final layer");
         } else if (section.name == "yolo") {
             layer.kind = Kind::yolo;
             layer.classes = integer(section, "classes");
@@ -311,15 +340,13 @@ Network Network::from_cfg(const std::string& path) {
             }
             for (int mask : layer.mask) if (mask < 0 || mask >= static_cast<int>(layer.anchors.size()))
                 throw std::runtime_error("yolo mask references missing anchor");
-            if (shape.c != static_cast<int>(layer.mask.size()) * (layer.classes + 5))
-                throw std::runtime_error("yolo channels must equal mask count * (classes + 5)");
             layer.ignore_thresh = floating(section, "ignore_thresh", "0.7");
             if (!(layer.ignore_thresh > 0.0f && layer.ignore_thresh <= 1.0f))
                 throw std::runtime_error("ignore_thresh must be in (0,1]");
-            layer.output = shape;
         } else {
             throw std::runtime_error("unsupported layer [" + section.name + "] at line " + std::to_string(section.line));
         }
+        layer.output = layer_output_shape(layer, shape, net.layers_);
         layer.output.elements();
         shape = layer.output;
         net.layers_.push_back(std::move(layer));
@@ -329,6 +356,18 @@ Network Network::from_cfg(const std::string& path) {
          net.layers_.back().kind != Kind::softmax))
         throw std::runtime_error("cfg needs a [yolo] head or final [softmax]");
     return net;
+}
+
+void Network::resize(int width, int height) {
+    positive(width, "width"); positive(height, "height");
+    input_.h = height; input_.w = width;
+    Shape shape = input_;
+    for (auto& layer : layers_) {
+        layer.input = shape;
+        layer.output = layer_output_shape(layer, shape, layers_);
+        layer.output.elements();
+        shape = layer.output;
+    }
 }
 
 void Network::load_weights(const std::string& path, int layer_limit) {

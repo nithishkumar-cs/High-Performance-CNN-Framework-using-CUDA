@@ -137,6 +137,53 @@ void check_parity_batch(const std::string& cfg,
     }
 }
 
+// CPU/GPU parity through a Darknet-style multiscale resize mid-training: mini.cfg's one
+// maxpool (stride 2) and one upsample (stride 2) exactly cancel, so doubling its 4x4 input to
+// 8x8 keeps the route layer's two branches matched, just like network.cpp's from_cfg validates
+// at the original size. Trains a few steps at 4x4, resizes both trainers, trains a few more at
+// 8x8, and asserts every learned parameter still matches - the decisive cross-check for
+// CudaTrainer::resize's device-buffer reallocation (the invasive, highest-risk part of
+// multiscale support) against the already-proven CPU path.
+void check_parity_resize(const std::string& cfg, int steps, const char* label) {
+    auto cpu_net = detector::Network::from_cfg(cfg);
+    cpu_net.initialize_random(17);
+    auto gpu_net = detector::Network::from_cfg(cfg);
+    gpu_net.initialize_random(17);
+    detector::Trainer cpu_trainer(cpu_net, detector::LearningRateSchedule{0.01f}, 1, 0.0005f);
+    detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.01f}, 1, 0.0005f);
+    std::vector<detector::Target> targets{{0, 0.5f, 0.5f, 0.25f, 0.25f}};
+
+    std::vector<float> small_input(cpu_net.input_shape().elements(), 0.2f);
+    float cpu_loss = 0, gpu_loss = 0;
+    for (int i = 0; i < steps; ++i) {
+        cpu_loss = cpu_trainer.step({small_input}, {targets}).loss;
+        gpu_loss = gpu_trainer.step({small_input}, {targets}).loss;
+    }
+
+    cpu_trainer.resize(8, 8);
+    gpu_trainer.resize(8, 8);
+    expect(cpu_net.input_shape().h == 8 && gpu_net.input_shape().h == 8, "resize did not take effect");
+    std::vector<float> large_input(cpu_net.input_shape().elements(), 0.2f);
+    for (int i = 0; i < steps; ++i) {
+        cpu_loss = cpu_trainer.step({large_input}, {targets}).loss;
+        gpu_loss = gpu_trainer.step({large_input}, {targets}).loss;
+    }
+    gpu_trainer.sync_to_network();
+
+    std::cout << "cuda_training_parity " << label << " cpu_loss=" << cpu_loss << " gpu_loss=" << gpu_loss << '\n';
+    expect(std::abs(cpu_loss - gpu_loss) < 1e-2f * std::max(1.0f, std::abs(cpu_loss)), "CPU/GPU loss mismatch after resize");
+    const auto& cpu_layers = cpu_net.layers();
+    const auto& gpu_layers = gpu_net.layers();
+    auto close = [](float x, float y) { return std::abs(x - y) < 1e-2f * std::max(1.0f, std::abs(x)); };
+    for (std::size_t i = 0; i < cpu_layers.size(); ++i) {
+        const auto& a = cpu_layers[i];
+        const auto& b = gpu_layers[i];
+        for (std::size_t p = 0; p < a.weights.size(); ++p) expect(close(a.weights[p], b.weights[p]), "weight mismatch after resize");
+        if (a.batch_normalize)
+            for (std::size_t p = 0; p < a.scales.size(); ++p) expect(close(a.scales[p], b.scales[p]), "scale mismatch after resize");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -165,6 +212,8 @@ int main() {
         check_parity_batch((directory / "mini.cfg").string(),
                            {{graph_input, {{0, 0.5f, 0.5f, 0.25f, 0.25f}}}, {graph_input_b, {{0, 0.3f, 0.7f, 0.2f, 0.3f}}}},
                            5, "bn_distinct_batch");
+
+        check_parity_resize((directory / "mini.cfg").string(), 3, "resize_mid_training");
 
         std::cout << "cuda training smoke passed\n";
         return 0;

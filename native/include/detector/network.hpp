@@ -65,6 +65,12 @@ public:
     // seeding a pretrained backbone whose later (shape-diverging) head layers are skipped - without
     // needing an intermediate truncated weights file, since it simply stops reading `path` early.
     void load_weights(const std::string& path, int layer_limit = -1);
+    // Recomputes every layer's input/output Shape for a new network input width/height (Darknet's
+    // periodic multiscale resize during training - see train_main.cpp's --multiscale options),
+    // leaving every learned parameter (weights, batch-norm scale/mean/variance, biases) untouched.
+    // Throws the same structural errors as from_cfg (e.g. a route/shortcut shape mismatch, or a
+    // convolution filter exceeding the new input) if the new size is incompatible with this cfg.
+    void resize(int width, int height);
     void initialize_random(std::uint32_t seed);
     void save_weights(const std::string& path) const;
     Shape input_shape() const { return input_; }

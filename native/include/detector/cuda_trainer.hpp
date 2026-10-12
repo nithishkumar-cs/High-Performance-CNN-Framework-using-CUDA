@@ -28,6 +28,10 @@ public:
                       const std::vector<std::vector<Target>>& targets);
     float current_learning_rate() const;
     void sync_to_network();
+    // Darknet-style multiscale resize: changes the network's (and this trainer's device buffers')
+    // input width/height between step() calls, preserving every learned parameter and all
+    // momentum/batch-norm running-statistics state. See cuda_training.cu's Impl::resize.
+    void resize(int width, int height);
 
 private:
     struct Impl;

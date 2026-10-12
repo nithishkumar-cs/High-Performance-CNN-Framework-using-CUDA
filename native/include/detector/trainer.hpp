@@ -57,6 +57,11 @@ public:
     // No-op: Trainer's weights already live on `network`. Lets callers that are generic over
     // Trainer and CudaTrainer (which does need this to copy device weights back) call it unconditionally.
     void sync_to_network() {}
+    // Darknet-style multiscale resize: Trainer keeps no shape-sized buffers of its own (step()
+    // allocates its per-call activation buffers from the network's current shapes), so this is
+    // just a forward to Network::resize - lets callers be generic over Trainer and CudaTrainer
+    // (which does need to reallocate device buffers) like sync_to_network() above.
+    void resize(int width, int height) { network_.resize(width, height); }
 
 private:
     Network& network_;

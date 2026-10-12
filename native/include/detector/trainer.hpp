@@ -1,6 +1,7 @@
 #pragma once
 
 #include "detector/network.hpp"
+#include <random>
 #include <vector>
 
 namespace detector {
@@ -77,6 +78,10 @@ private:
     std::vector<std::vector<float>> weight_velocity_;
     std::vector<std::vector<float>> bias_velocity_;
     std::vector<std::vector<float>> scale_velocity_;
+    // Dropout layers' per-element keep/drop decisions: a real (not --seed-reproducible) source of
+    // randomness, matching Darknet's own rand()-based dropout - unlike the training seed, a
+    // dropout mask's exact realization is not a correctness requirement.
+    std::mt19937 dropout_rng_{std::random_device{}()};
 };
 
 }  // namespace detector

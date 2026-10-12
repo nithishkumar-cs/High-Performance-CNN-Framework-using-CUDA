@@ -15,7 +15,7 @@ struct Shape {
     std::size_t elements() const;
 };
 
-enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut };
+enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg };
 enum class Backend { cpu, cuda, tensorrt };
 
 struct Layer {
@@ -32,6 +32,9 @@ struct Layer {
     float ignore_thresh = 1.0f;  // yolo layers only: skip objectness-negative loss for predicted
                                   // boxes overlapping any ground truth by at least this IoU (Darknet's
                                   // near-miss "ignore" rule); 1.0 (unreachable) disables it.
+    float dropout_probability = 0.5f;  // dropout layers only: fraction of activations zeroed during
+                                        // training (inverted dropout - kept activations scaled by
+                                        // 1/(1-p)); a no-op at inference, matching Darknet.
     std::vector<int> sources;
     std::vector<int> mask;
     std::vector<std::pair<float, float>> anchors;

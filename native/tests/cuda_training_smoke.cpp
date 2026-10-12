@@ -184,6 +184,29 @@ void check_parity_resize(const std::string& cfg, int steps, const char* label) {
     }
 }
 
+// Dropout draws its mask from unrelated RNGs on CPU (std::mt19937) and GPU (a device xorshift
+// hash), so unlike every other layer here, CPU and GPU losses/weights are NOT expected to match
+// bit-for-bit - this only checks that CudaTrainer's dropout kernels are wired correctly (finite
+// loss, runs to completion, weights actually change) independently of the CPU trainer.
+void check_dropout_runs(const std::string& cfg, const std::vector<float>& input,
+                        const std::vector<detector::Target>& targets, int steps) {
+    auto gpu_net = detector::Network::from_cfg(cfg);
+    gpu_net.initialize_random(17);
+    auto initial_weights = gpu_net.layers()[0].weights;
+    detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.05f}, 1, 0.0005f);
+    float loss = 0;
+    for (int i = 0; i < steps; ++i) {
+        loss = gpu_trainer.step({input}, {targets}).loss;
+        expect(std::isfinite(loss), "dropout CUDA training step produced a non-finite loss");
+    }
+    gpu_trainer.sync_to_network();
+    std::cout << "cuda_dropout_smoke loss=" << loss << '\n';
+    bool changed = false;
+    for (std::size_t p = 0; p < initial_weights.size(); ++p)
+        if (std::abs(gpu_net.layers()[0].weights[p] - initial_weights[p]) > 1e-8f) changed = true;
+    expect(changed, "dropout CUDA training did not update weights");
+}
+
 }  // namespace
 
 int main() {
@@ -214,6 +237,14 @@ int main() {
                            5, "bn_distinct_batch");
 
         check_parity_resize((directory / "mini.cfg").string(), 3, "resize_mid_training");
+
+        // Reorg has no learnable parameters and no randomness, so unlike dropout it fits the
+        // exact CPU/GPU parity harness directly.
+        std::vector<float> reorg_input(detector::Network::from_cfg((directory / "reorg-train.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < reorg_input.size(); ++i) reorg_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        check_parity((directory / "reorg-train.cfg").string(), reorg_input, {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 1, "reorg");
+
+        check_dropout_runs((directory / "dropout-train.cfg").string(), {0.4f}, {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 20);
 
         std::cout << "cuda training smoke passed\n";
         return 0;

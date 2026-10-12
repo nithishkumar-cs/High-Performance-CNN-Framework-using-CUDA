@@ -249,6 +249,39 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                             result[static_cast<std::size_t>(c) * out_plane + y * layer.output.w + x] =
                                 previous[static_cast<std::size_t>(c) * in_plane + (y / layer.stride) * layer.input.w + x / layer.stride];
             }
+        } else if (layer.kind == Kind::dropout) {
+            // Inverted dropout: kept elements scaled by 1/(1-p) so the expectation matches
+            // inference's unscaled passthrough; the per-element scale (0 or 1/(1-p)) is stashed in
+            // `preactivation` (otherwise unused by this kind) so backward reuses the exact same
+            // mask this forward pass drew, not a freshly re-rolled one.
+            float keep_scale = 1.0f / (1.0f - layer.dropout_probability);
+            std::bernoulli_distribution drop(layer.dropout_probability);
+            for (std::size_t s = 0; s < n; ++s) {
+                const auto& previous = previous_of(s);
+                auto& result = output[s][index];
+                preactivation[s][index].resize(result.size());
+                for (std::size_t p = 0; p < result.size(); ++p) {
+                    float scale = drop(dropout_rng_) ? 0.0f : keep_scale;
+                    preactivation[s][index][p] = scale;
+                    result[p] = previous[p] * scale;
+                }
+            }
+        } else if (layer.kind == Kind::reorg) {
+            // Space-to-depth rearrangement (see network.cpp's reorg_forward for the shared
+            // convention); no learnable parameters, just a one-to-one position mapping.
+            int in_plane = layer.input.h * layer.input.w;
+            int out_w = layer.output.w, out_plane = layer.output.h * out_w;
+            for (std::size_t s = 0; s < n; ++s) {
+                const auto& previous = previous_of(s);
+                auto& result = output[s][index];
+                for (int ic = 0; ic < layer.input.c; ++ic)
+                    for (int iy = 0; iy < layer.input.h; ++iy)
+                        for (int ix = 0; ix < layer.input.w; ++ix) {
+                            int oc = ic * layer.stride * layer.stride + (iy % layer.stride) * layer.stride + (ix % layer.stride);
+                            result[static_cast<std::size_t>(oc) * out_plane + (iy / layer.stride) * out_w + (ix / layer.stride)] =
+                                previous[static_cast<std::size_t>(ic) * in_plane + iy * layer.input.w + ix];
+                        }
+            }
         } else {
             for (std::size_t s = 0; s < n; ++s) output[s][index] = previous_of(s);
         }
@@ -329,6 +362,27 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                                     if (previous[p] > best) { best = previous[p]; best_pos = p; }
                                 }
                             gradient[s][reverse - 1][best_pos] += grad[static_cast<std::size_t>(c) * out_plane + oy * layer.output.w + ox];
+                        }
+            }
+        } else if (layer.kind == Kind::dropout) {
+            if (!reverse) continue;
+            for (std::size_t s = 0; s < n; ++s) {
+                auto& grad = gradient[s][reverse];
+                for (std::size_t p = 0; p < grad.size(); ++p)
+                    gradient[s][reverse - 1][p] += grad[p] * preactivation[s][reverse][p];
+            }
+        } else if (layer.kind == Kind::reorg) {
+            if (!reverse) continue;
+            int in_plane = layer.input.h * layer.input.w;
+            int out_w = layer.output.w, out_plane = layer.output.h * out_w;
+            for (std::size_t s = 0; s < n; ++s) {
+                auto& grad = gradient[s][reverse];
+                for (int ic = 0; ic < layer.input.c; ++ic)
+                    for (int iy = 0; iy < layer.input.h; ++iy)
+                        for (int ix = 0; ix < layer.input.w; ++ix) {
+                            int oc = ic * layer.stride * layer.stride + (iy % layer.stride) * layer.stride + (ix % layer.stride);
+                            gradient[s][reverse - 1][static_cast<std::size_t>(ic) * in_plane + iy * layer.input.w + ix] +=
+                                grad[static_cast<std::size_t>(oc) * out_plane + (iy / layer.stride) * out_w + (ix / layer.stride)];
                         }
             }
         } else {

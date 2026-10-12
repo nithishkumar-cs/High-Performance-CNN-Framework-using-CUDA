@@ -122,6 +122,13 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
     }
     case Kind::upsample:
         return {shape.c, shape.h * layer.stride, shape.w * layer.stride};
+    case Kind::dropout:
+        return shape;
+    case Kind::reorg: {
+        if (shape.h % layer.stride != 0 || shape.w % layer.stride != 0)
+            throw std::runtime_error("reorg stride must divide the input height and width");
+        return {shape.c * layer.stride * layer.stride, shape.h / layer.stride, shape.w / layer.stride};
+    }
     case Kind::shortcut: {
         const Shape& branch = layers_so_far.at(static_cast<std::size_t>(layer.sources.at(0))).output;
         if (branch.c != shape.c || branch.h != shape.h || branch.w != shape.w)
@@ -165,6 +172,27 @@ float iou(const Detection& a, const Detection& b) {
     float area_b = std::max(0.0f, b.x2 - b.x1) * std::max(0.0f, b.y2 - b.y1);
     float area = area_a + area_b - intersection;
     return area > 0 ? intersection / area : 0.0f;
+}
+
+// Space-to-depth channel/spatial rearrangement (YOLOv2-style reorg layer): a one-to-one position
+// mapping with no learnable parameters, input (ic, iy, ix) -> output channel
+// ic*stride*stride + (iy%stride)*stride + (ix%stride), spatial (iy/stride, ix/stride). This is
+// this project's own consistent convention (independently derived, not copied from Darknet
+// source) - any bijection works for training since reorg has no weights, but it has not been
+// cross-checked against original Darknet's exact channel interleaving, so a pretrained Darknet
+// YOLOv2 backbone loaded around a reorg layer is not guaranteed to decode identically through it.
+void reorg_forward(const std::vector<float>& input, std::vector<float>& output,
+                   int channels, int height, int width, int stride) {
+    int out_h = height / stride, out_w = width / stride;
+    std::size_t in_plane = static_cast<std::size_t>(height) * width;
+    std::size_t out_plane = static_cast<std::size_t>(out_h) * out_w;
+    for (int ic = 0; ic < channels; ++ic)
+        for (int iy = 0; iy < height; ++iy)
+            for (int ix = 0; ix < width; ++ix) {
+                int oc = ic * stride * stride + (iy % stride) * stride + (ix % stride);
+                output[static_cast<std::size_t>(oc) * out_plane + (iy / stride) * out_w + (ix / stride)] =
+                    input[static_cast<std::size_t>(ic) * in_plane + static_cast<std::size_t>(iy) * width + ix];
+            }
 }
 
 std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& input) {
@@ -252,6 +280,10 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
             }
             for (float& value : out) value /= total;
             heads.push_back({index, out});
+        } else if (layer.kind == Kind::dropout) {
+            out = source;  // no-op at inference, matching Darknet (dropout only affects training)
+        } else if (layer.kind == Kind::reorg) {
+            reorg_forward(source, out, layer.input.c, layer.input.h, layer.input.w, layer.stride);
         } else {
             out = source;
             heads.push_back({index, out});
@@ -307,6 +339,15 @@ Network Network::from_cfg(const std::string& path) {
             layer.kind = Kind::upsample;
             layer.stride = integer(section, "stride");
             positive(layer.stride, "upsample stride");
+        } else if (section.name == "dropout") {
+            layer.kind = Kind::dropout;
+            layer.dropout_probability = floating(section, "probability", "0.5");
+            if (!(layer.dropout_probability > 0.0f && layer.dropout_probability < 1.0f))
+                throw std::runtime_error("dropout probability must be in (0,1)");
+        } else if (section.name == "reorg") {
+            layer.kind = Kind::reorg;
+            layer.stride = integer(section, "stride", "2");
+            positive(layer.stride, "reorg stride");
         } else if (section.name == "shortcut") {
             layer.kind = Kind::shortcut;
             int from = integer(section, "from");

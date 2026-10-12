@@ -187,6 +187,59 @@ __global__ void shortcut_forward(const float* previous, const float* branch, flo
     output[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
 
+// Space-to-depth rearrangement (see network.cpp's reorg_forward for the shared convention this
+// mirrors, independently re-derived here since this translation unit cannot call into it); a
+// bijection with no learnable parameters, so forward/backward each need only one thread per
+// element with no atomics (every thread targets a distinct destination).
+__global__ void reorg_forward_kernel(const float* input, float* output, int channels, int ih, int iw, int stride) {
+    int out_h = ih / stride, out_w = iw / stride, out_c = channels * stride * stride;
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= out_c * out_h * out_w) return;
+    int ox = pos % out_w, oy = pos / out_w % out_h, oc = pos / (out_w * out_h);
+    int ic = oc / (stride * stride), offset = oc % (stride * stride);
+    int ix = ox * stride + offset % stride, iy = oy * stride + offset / stride;
+    output[pos] = input[(static_cast<std::size_t>(ic) * ih + iy) * iw + ix];
+}
+
+__global__ void reorg_backward_kernel(const float* gradient, float* previous_gradient, int channels,
+                                      int ih, int iw, int stride) {
+    int out_h = ih / stride, out_w = iw / stride, out_c = channels * stride * stride;
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= out_c * out_h * out_w) return;
+    int ox = pos % out_w, oy = pos / out_w % out_h, oc = pos / (out_w * out_h);
+    int ic = oc / (stride * stride), offset = oc % (stride * stride);
+    int ix = ox * stride + offset % stride, iy = oy * stride + offset / stride;
+    previous_gradient[(static_cast<std::size_t>(ic) * ih + iy) * iw + ix] += gradient[pos];
+}
+
+// Non-cryptographic xorshift hash -> uniform float in [0,1); only needs to look random enough
+// for dropout's keep/drop decision, not withstand adversarial analysis. `seed` is derived from
+// (iteration, layer, sample, position) so every element gets an independent-looking draw and
+// every step() call redraws a fresh mask - this is a real (not --seed-reproducible) source of
+// randomness, matching Darknet's own rand()-based dropout and this project's CPU Trainer (see
+// trainer.hpp's dropout_rng_), not CPU/GPU bit-identical since the two use unrelated algorithms.
+__device__ __forceinline__ float hash_uniform(unsigned int seed) {
+    seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5;
+    return (seed & 0x00FFFFFFu) / 16777216.0f;
+}
+
+// Inverted dropout: kept elements scaled by 1/(1-p). `scale_out` stashes the per-element 0 or
+// keep_scale decision so dropout_backward reuses the exact mask this forward pass drew.
+__global__ void dropout_forward(const float* input, float* output, float* scale_out, int count,
+                                float probability, float keep_scale, unsigned int seed) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= count) return;
+    float scale = hash_uniform(seed + static_cast<unsigned int>(pos) * 2654435761u) < probability ? 0.0f : keep_scale;
+    scale_out[pos] = scale;
+    output[pos] = input[pos] * scale;
+}
+
+__global__ void dropout_backward(const float* gradient, const float* scale, float* previous_gradient, int count) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= count) return;
+    previous_gradient[pos] += gradient[pos] * scale[pos];
+}
+
 __global__ void activation_backward(float* gradient, const float* preactivation, int count, bool leaky) {
     int pos = blockIdx.x * blockDim.x + threadIdx.x;
     if (pos < count && leaky && preactivation[pos] < 0) gradient[pos] *= 0.1f;
@@ -383,9 +436,10 @@ struct CudaTrainer::Impl {
         const auto& layers = net.layers();
         for (const auto& layer : layers)
             if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::route &&
-                layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo)
+                layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo &&
+                layer.kind != Kind::dropout && layer.kind != Kind::reorg)
                 throw std::runtime_error("CUDA detector training supports convolutional, maxpool, route, "
-                                          "upsample, shortcut and yolo layers only");
+                                          "upsample, shortcut, yolo, dropout and reorg layers only");
         // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
         // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
         // statistics (and every other per-sample forward/backward op) can run within one step().
@@ -405,7 +459,12 @@ struct CudaTrainer::Impl {
             output[i] = memory.floats(batch_elems * layer.output.elements());
             gradient[i] = memory.floats(batch_elems * layer.output.elements());
             if (layer.kind == Kind::maxpool) { max_index[i] = memory.ints(batch_elems * layer.output.elements()); continue; }
-            if (layer.kind == Kind::shortcut) { preactivation[i] = memory.floats(batch_elems * layer.output.elements()); continue; }
+            // Dropout reuses the shortcut-style `preactivation` slot to stash each element's
+            // per-step 0/keep_scale draw, so backward replays the exact mask forward drew.
+            if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout) {
+                preactivation[i] = memory.floats(batch_elems * layer.output.elements());
+                continue;
+            }
             if (layer.kind != Kind::convolutional) continue;
             preactivation[i] = memory.floats(batch_elems * layer.output.elements());
             std::size_t fan_in = static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
@@ -453,7 +512,7 @@ struct CudaTrainer::Impl {
             memory.replace(output[i], elems);
             memory.replace(gradient[i], elems);
             if (layer.kind == Kind::maxpool) { memory.replace(max_index[i], elems); continue; }
-            if (layer.kind == Kind::shortcut) { memory.replace(preactivation[i], elems); continue; }
+            if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout) { memory.replace(preactivation[i], elems); continue; }
             if (layer.kind != Kind::convolutional) continue;
             memory.replace(preactivation[i], elems);
             if (layer.batch_normalize) memory.replace(raw[i], elems);
@@ -541,6 +600,23 @@ struct CudaTrainer::Impl {
                 for (std::size_t s = 0; s < n; ++s) {
                     shortcut_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[source] + s * elems,
                         preactivation[i] + s * elems, output[i] + s * elems, elements, layer.leaky);
+                    launch_check();
+                }
+            } else if (layer.kind == Kind::dropout) {
+                float keep_scale = 1.0f / (1.0f - layer.dropout_probability);
+                for (std::size_t s = 0; s < n; ++s) {
+                    // Seed mixes iteration/layer/sample so every call, layer and sample draws an
+                    // independent-looking mask (a fresh one each step(), like Darknet's rand()).
+                    unsigned int seed = static_cast<unsigned int>(iteration) * 2654435761u +
+                                         static_cast<unsigned int>(i) * 40503u + static_cast<unsigned int>(s) * 97u + 12345u;
+                    dropout_forward<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems,
+                        preactivation[i] + s * elems, elements, layer.dropout_probability, keep_scale, seed);
+                    launch_check();
+                }
+            } else if (layer.kind == Kind::reorg) {
+                for (std::size_t s = 0; s < n; ++s) {
+                    reorg_forward_kernel<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems,
+                        layer.input.c, layer.input.h, layer.input.w, layer.stride);
                     launch_check();
                 }
             } else {  // yolo: pass-through, matching the CPU trainer's forward for terminal heads.
@@ -633,6 +709,20 @@ struct CudaTrainer::Impl {
                     for (std::size_t s = 0; s < n; ++s) {
                         max_pool_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, max_index[reverse] + s * elems,
                             prev_grad_of(s), elements);
+                        launch_check();
+                    }
+            } else if (layer.kind == Kind::dropout) {
+                if (reverse)
+                    for (std::size_t s = 0; s < n; ++s) {
+                        dropout_backward<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems,
+                            preactivation[reverse] + s * elems, prev_grad_of(s), elements);
+                        launch_check();
+                    }
+            } else if (layer.kind == Kind::reorg) {
+                if (reverse)
+                    for (std::size_t s = 0; s < n; ++s) {
+                        reorg_backward_kernel<<<blocks_for(elements), kThreads>>>(gradient[reverse] + s * elems, prev_grad_of(s),
+                            layer.input.c, layer.input.h, layer.input.w, layer.stride);
                         launch_check();
                     }
             } else {  // convolutional

@@ -88,6 +88,18 @@ __global__ void shortcut_add(const float* input, const float* branch, float* out
     output[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
 
+// Space-to-depth rearrangement (see network.cpp's reorg_forward for the shared convention this
+// mirrors); one thread per OUTPUT element, each reading its one corresponding input position.
+__global__ void reorg(const float* input, float* output, int channels, int ih, int iw, int stride) {
+    int out_h = ih / stride, out_w = iw / stride, out_c = channels * stride * stride;
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= out_c * out_h * out_w) return;
+    int ox = pos % out_w, oy = pos / out_w % out_h, oc = pos / (out_w * out_h);
+    int ic = oc / (stride * stride), offset = oc % (stride * stride);
+    int ix = ox * stride + offset % stride, iy = oy * stride + offset / stride;
+    output[pos] = input[(static_cast<std::size_t>(ic) * ih + iy) * iw + ix];
+}
+
 __global__ void connected(const float* input, const float* weights, const float* bias,
                           float* output, int inputs, int outputs, bool leaky) {
     int oc = blockIdx.x * blockDim.x + threadIdx.x;
@@ -190,6 +202,12 @@ struct CudaSession::Impl {
                 const auto& param = parameters[index];
                 connected<<<blocks, threads>>>(previous, param.weights, param.offsets, result,
                     static_cast<int>(layer.input.elements()), layer.filters, layer.leaky);
+                launch_check();
+            } else if (layer.kind == Kind::dropout) {
+                check(cudaMemcpy(result, previous, layer.output.elements() * sizeof(float), cudaMemcpyDeviceToDevice),
+                      "cudaMemcpy dropout");  // no-op at inference, matching Darknet
+            } else if (layer.kind == Kind::reorg) {
+                reorg<<<blocks, threads>>>(previous, result, layer.input.c, layer.input.h, layer.input.w, layer.stride);
                 launch_check();
             } else if (layer.kind == Kind::softmax) {
                 softmax_vector<<<1, 1>>>(previous, result, elements);

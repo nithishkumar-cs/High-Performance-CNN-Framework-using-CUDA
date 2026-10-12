@@ -161,6 +161,55 @@ int main() {
         auto resized_heads = resize_net.forward(resized_input, detector::Backend::cpu);
         expect(resized_heads.size() == 1 && resized_heads[0].values.size() == 6 * 8 * 8, "resize: forward output shape");
 
+        // Reorg (space-to-depth) layer: input channel `ic`'s pixel (iy,ix) is value ic*100+iy*4+ix
+        // (c=3,h=4,w=4); stride=2 must route it to output channel ic*4+(iy%2)*2+(ix%2), spatial
+        // (iy/2,ix/2) - these spot checks are independently hand-derived from that formula, not
+        // just re-calling it, plus a permutation invariant (same multiset of values) over the rest.
+        const auto reorg_cfg = std::filesystem::path(__FILE__).parent_path() / "reorg.cfg";
+        auto reorg_net = detector::Network::from_cfg(reorg_cfg.string());
+        expect(reorg_net.layers()[0].output.c == 12 && reorg_net.layers()[0].output.h == 2, "reorg layer shape");
+        std::vector<float> reorg_input(48);
+        for (int ic = 0; ic < 3; ++ic)
+            for (int iy = 0; iy < 4; ++iy)
+                for (int ix = 0; ix < 4; ++ix)
+                    reorg_input[static_cast<std::size_t>(ic * 16 + iy * 4 + ix)] = static_cast<float>(ic * 100 + iy * 4 + ix);
+        auto reorg_heads = reorg_net.forward(reorg_input, detector::Backend::cpu);
+        expect(reorg_heads.size() == 1 && reorg_heads[0].values.size() == 48, "reorg head shape");
+        auto check_reorg = [&](int ic, int iy, int ix) {
+            int oc = ic * 4 + (iy % 2) * 2 + (ix % 2), sp = (iy / 2) * 2 + ix / 2;
+            float expected = static_cast<float>(ic * 100 + iy * 4 + ix);
+            expect(std::abs(reorg_heads[0].values[static_cast<std::size_t>(oc * 4 + sp)] - expected) < 1e-6f,
+                   "reorg space-to-depth mapping");
+        };
+        check_reorg(0, 0, 0); check_reorg(0, 3, 3); check_reorg(1, 2, 1); check_reorg(2, 1, 3); check_reorg(2, 3, 0);
+        float reorg_sum_in = 0, reorg_sum_out = 0;
+        for (float v : reorg_input) reorg_sum_in += v;
+        for (float v : reorg_heads[0].values) reorg_sum_out += v;
+        expect(std::abs(reorg_sum_in - reorg_sum_out) < 1e-3f, "reorg must be a pure permutation (sum-preserving)");
+#ifdef DETECTOR_HAS_CUDA
+        if (devices > 0) {
+            auto reorg_gpu = reorg_net.forward(reorg_input, detector::Backend::cuda);
+            for (std::size_t i = 0; i < reorg_heads[0].values.size(); ++i)
+                expect(std::abs(reorg_gpu[0].values[i] - reorg_heads[0].values[i]) < 1e-4f, "reorg CPU/CUDA parity");
+        }
+#endif
+
+        // Dropout layer: a no-op at inference (Darknet only applies it during training).
+        const auto dropout_cfg = std::filesystem::path(__FILE__).parent_path() / "dropout.cfg";
+        auto dropout_net = detector::Network::from_cfg(dropout_cfg.string());
+        std::vector<float> dropout_input{0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f};
+        auto dropout_heads = dropout_net.forward(dropout_input, detector::Backend::cpu);
+        expect(dropout_heads[0].values.size() == 6, "dropout head shape");
+        for (std::size_t i = 0; i < dropout_input.size(); ++i)
+            expect(std::abs(dropout_heads[0].values[i] - dropout_input[i]) < 1e-6f, "dropout must be a no-op at inference");
+#ifdef DETECTOR_HAS_CUDA
+        if (devices > 0) {
+            auto dropout_gpu = dropout_net.forward(dropout_input, detector::Backend::cuda);
+            for (std::size_t i = 0; i < dropout_input.size(); ++i)
+                expect(std::abs(dropout_gpu[0].values[i] - dropout_input[i]) < 1e-4f, "dropout CUDA must also be a no-op at inference");
+        }
+#endif
+
         std::cout << "detector smoke tests passed\n";
         return 0;
     } catch (const std::exception& error) {

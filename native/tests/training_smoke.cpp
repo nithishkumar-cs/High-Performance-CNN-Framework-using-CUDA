@@ -57,6 +57,38 @@ int main() {
         for (int i = 0; i < 49; ++i) shortcut_last = shortcut_trainer.step({shortcut_input}, {shortcut_targets}).loss;
         expect(std::isfinite(shortcut_last) && shortcut_last < shortcut_first, "shortcut layer loss did not fall");
 
+        // Reorg (space-to-depth) layer: forward+backward must run and reduce loss through a
+        // preceding conv's weights, exercising training.cpp's own copy of the reorg mapping
+        // (independent from network.cpp's inference-only cpu_forward) and its backward (gradient
+        // scatter back through the same bijection).
+        auto reorg_net = detector::Network::from_cfg((directory / "reorg-train.cfg").string());
+        reorg_net.initialize_random(13);
+        detector::Trainer reorg_trainer(reorg_net, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
+        std::vector<float> reorg_input(reorg_net.input_shape().elements());
+        for (std::size_t i = 0; i < reorg_input.size(); ++i) reorg_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        std::vector<detector::Target> reorg_targets{{0, 0.5f, 0.5f, 0.3f, 0.3f}};
+        float reorg_first = reorg_trainer.step({reorg_input}, {reorg_targets}).loss;
+        float reorg_last = reorg_first;
+        for (int i = 0; i < 49; ++i) reorg_last = reorg_trainer.step({reorg_input}, {reorg_targets}).loss;
+        expect(std::isfinite(reorg_last) && reorg_last < reorg_first, "reorg layer loss did not fall");
+
+        // Dropout layer: forward+backward must run to a finite loss despite the random mask
+        // (probability=0.1 in dropout-train.cfg keeps the step's gradient mostly intact, so loss
+        // should still trend down over many steps even though each individual step is noisy).
+        auto dropout_net = detector::Network::from_cfg((directory / "dropout-train.cfg").string());
+        dropout_net.initialize_random(15);
+        detector::Trainer dropout_trainer(dropout_net, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
+        std::vector<float> dropout_input{0.4f};
+        std::vector<detector::Target> dropout_targets{{0, 0.5f, 0.5f, 0.5f, 0.5f}};
+        float dropout_first = dropout_trainer.step({dropout_input}, {dropout_targets}).loss;
+        float dropout_last = dropout_first;
+        for (int i = 0; i < 199; ++i) {
+            float loss = dropout_trainer.step({dropout_input}, {dropout_targets}).loss;
+            expect(std::isfinite(loss), "dropout training step produced a non-finite loss");
+            dropout_last = loss;
+        }
+        expect(dropout_last < dropout_first, "dropout layer loss did not trend down over 200 steps");
+
         // True minibatch batch-norm: a single step() call with `batch_size` identical copies of
         // one sample must learn exactly as a batch_size=1 trainer does on that one sample, since
         // batch statistics over N identical copies equal that one sample's own statistics, and

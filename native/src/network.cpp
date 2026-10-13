@@ -112,13 +112,21 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
     case Kind::maxpool:
         return {shape.c, (shape.h - 1) / layer.stride + 1, (shape.w - 1) / layer.stride + 1};
     case Kind::route: {
+        // Branches are validated against each other, not against the incoming sequential `shape`:
+        // a standalone passthrough route (e.g. Darknet's YOLOv2 `[route] layers=-9`, jumping back
+        // to an earlier layer at a different spatial resolution than the layer immediately before
+        // it) is standard and must not be rejected just because it doesn't match what came right
+        // before it in the sequential graph.
         int channels = 0;
+        Shape reference{};
+        bool first = true;
         for (int resolved : layer.sources) {
             const Shape& branch = layers_so_far.at(static_cast<std::size_t>(resolved)).output;
-            if (branch.h != shape.h || branch.w != shape.w) throw std::runtime_error("route spatial shapes differ");
+            if (first) { reference = branch; first = false; }
+            else if (branch.h != reference.h || branch.w != reference.w) throw std::runtime_error("route spatial shapes differ");
             channels += branch.c;
         }
-        return {channels, shape.h, shape.w};
+        return {channels, reference.h, reference.w};
     }
     case Kind::upsample:
         return {shape.c, shape.h * layer.stride, shape.w * layer.stride};

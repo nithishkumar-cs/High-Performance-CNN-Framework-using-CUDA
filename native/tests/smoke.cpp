@@ -194,6 +194,18 @@ int main() {
         }
 #endif
 
+        // Route layer spatial-shape validation must compare branches to each other, not to the
+        // running sequential shape: a standalone passthrough route (Darknet's YOLOv2-style
+        // `[route] layers=-9` pattern, jumping back to an earlier layer at a different spatial
+        // resolution than the layer immediately before the route) is standard and must not be
+        // rejected. route-passthrough.cfg's lone route (layers=-2) resolves to the pre-maxpool
+        // conv (4x4), which differs from the route's immediately-preceding maxpool output (2x2).
+        const auto route_cfg = std::filesystem::path(__FILE__).parent_path() / "route-passthrough.cfg";
+        auto route_net = detector::Network::from_cfg(route_cfg.string());
+        expect(route_net.layers()[2].output.c == 2 && route_net.layers()[2].output.h == 4 &&
+                   route_net.layers()[2].output.w == 4,
+               "passthrough route resolves to its source's shape, not the preceding layer's");
+
         // Dropout layer: a no-op at inference (Darknet only applies it during training).
         const auto dropout_cfg = std::filesystem::path(__FILE__).parent_path() / "dropout.cfg";
         auto dropout_net = detector::Network::from_cfg(dropout_cfg.string());

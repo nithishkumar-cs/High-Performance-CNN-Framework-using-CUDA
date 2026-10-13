@@ -89,6 +89,20 @@ int main() {
         }
         expect(dropout_last < dropout_first, "dropout layer loss did not trend down over 200 steps");
 
+        // Region (YOLOv2-style) layer: forward+backward must run and reduce loss through a
+        // preceding conv's weights, exercising the softmax class loss, rescore and scale-knob
+        // branches in yolo_loss.cpp (shared with the CUDA trainer) that only [region] layers take.
+        auto region_net = detector::Network::from_cfg((directory / "region-train.cfg").string());
+        region_net.initialize_random(19);
+        detector::Trainer region_trainer(region_net, detector::LearningRateSchedule{0.05f}, 1, 0.0f);
+        std::vector<float> region_input(region_net.input_shape().elements());
+        for (std::size_t i = 0; i < region_input.size(); ++i) region_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        std::vector<detector::Target> region_targets{{1, 0.5f, 0.5f, 0.3f, 0.3f}};
+        float region_first = region_trainer.step({region_input}, {region_targets}).loss;
+        float region_last = region_first;
+        for (int i = 0; i < 49; ++i) region_last = region_trainer.step({region_input}, {region_targets}).loss;
+        expect(std::isfinite(region_last) && region_last < region_first, "region layer loss did not fall");
+
         // True minibatch batch-norm: a single step() call with `batch_size` identical copies of
         // one sample must learn exactly as a batch_size=1 trainer does on that one sample, since
         // batch statistics over N identical copies equal that one sample's own statistics, and

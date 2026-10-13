@@ -103,10 +103,11 @@ int main(int argc, char** argv) {
         if (options.limit > 0 && images.size() > static_cast<std::size_t>(options.limit))
             images.resize(options.limit);
         int classes = -1;
-        for (const auto& layer : network.layers()) if (layer.kind == detector::Kind::yolo) {
-            if (classes < 0) classes = layer.classes;
-            else if (classes != layer.classes) throw std::runtime_error("YOLO heads disagree on class count");
-        }
+        for (const auto& layer : network.layers())
+            if (layer.kind == detector::Kind::yolo || layer.kind == detector::Kind::region) {
+                if (classes < 0) classes = layer.classes;
+                else if (classes != layer.classes) throw std::runtime_error("detection heads disagree on class count");
+            }
 #ifdef DETECTOR_HAS_CUDA
         std::unique_ptr<detector::CudaSession> cuda;
         if (options.backend == detector::Backend::cuda)

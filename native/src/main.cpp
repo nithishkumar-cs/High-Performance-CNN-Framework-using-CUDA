@@ -88,6 +88,9 @@ const char* kind_name(detector::Kind kind) {
     case detector::Kind::connected: return "connected";
     case detector::Kind::softmax: return "softmax";
     case detector::Kind::shortcut: return "shortcut";
+    case detector::Kind::dropout: return "dropout";
+    case detector::Kind::reorg: return "reorg";
+    case detector::Kind::region: return "region";
     }
     return "unknown";
 }

@@ -1,6 +1,8 @@
 #include "detector/yolo_loss.hpp"
 #include <algorithm>
+#include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace detector {
@@ -40,9 +42,15 @@ struct Assignment {
     float log_width = 0;
     float log_height = 0;
     // Darknet's (2 - truth.w*truth.h) coordinate-loss scale (truth fractions of the network
-    // input); up-weights small boxes relative to large ones. Applied to x/y/w/h only.
+    // input) folded together with the layer's coord_scale (1 for yolo, cfg-set for region);
+    // up-weights small boxes relative to large ones. Applied to x/y/w/h only.
     float box_scale = 1.0f;
+    // Matched truth box in input-pixel units, kept only for region's `rescore` (objectness target
+    // = predicted-box IoU with this truth instead of a flat 1); unused by yolo layers.
+    float truth_cx = 0, truth_cy = 0, truth_w = 0, truth_h = 0;
 };
+
+bool is_detection_head(Kind kind) { return kind == Kind::yolo || kind == Kind::region; }
 
 }  // namespace
 
@@ -64,7 +72,7 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
         float best_iou = -1;
         for (std::size_t index = 0; index < layers.size(); ++index) {
             const auto& layer = layers[index];
-            if (layer.kind != Kind::yolo) continue;
+            if (!is_detection_head(layer.kind)) continue;
             if (target.class_id < 0 || target.class_id >= layer.classes) throw std::runtime_error("target class outside cfg classes");
             for (int slot = 0; slot < static_cast<int>(layer.mask.size()); ++slot) {
                 const auto [aw, ah] = layer.anchors[static_cast<std::size_t>(layer.mask[slot])];
@@ -84,17 +92,30 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
             std::clamp(grid_x - cell_x, 0.0f, 1.0f), std::clamp(grid_y - cell_y, 0.0f, 1.0f),
             std::log(target.width * input.w / aw),
             std::log(target.height * input.h / ah),
-            2.0f - target.width * target.height});
+            layer.coord_scale * (2.0f - target.width * target.height),
+            target.cx * input.w, target.cy * input.h, target.width * input.w, target.height * input.h});
     }
 
     float loss = 0;
     for (std::size_t index = 0; index < layers.size(); ++index) {
         const auto& layer = layers[index];
-        if (layer.kind != Kind::yolo) continue;
+        if (!is_detection_head(layer.kind)) continue;
+        bool is_region = layer.kind == Kind::region;
         int area = layer.output.h * layer.output.w;
         int attrs = layer.classes + 5;
         auto pos = [&](int anchor, int attribute, int cell) {
             return (static_cast<std::size_t>(anchor) * attrs + attribute) * area + cell;
+        };
+        // Decodes (anchor, cell)'s predicted box in input-pixel units (same math as network.cpp's
+        // decode()); shared by the ignore_thresh near-miss check below and region's `rescore`.
+        auto decode_box = [&](int anchor, int cell) {
+            int x = cell % layer.output.w, y = cell / layer.output.w;
+            auto [aw, ah] = layer.anchors[static_cast<std::size_t>(layer.mask[static_cast<std::size_t>(anchor)])];
+            float px = (sigmoid(output[index][pos(anchor, 0, cell)]) + x) * input.w / layer.output.w;
+            float py = (sigmoid(output[index][pos(anchor, 1, cell)]) + y) * input.h / layer.output.h;
+            float pw = std::exp(std::clamp(output[index][pos(anchor, 2, cell)], -20.0f, 20.0f)) * aw;
+            float ph = std::exp(std::clamp(output[index][pos(anchor, 3, cell)], -20.0f, 20.0f)) * ah;
+            return std::array<float, 4>{px, py, pw, ph};
         };
         std::vector<unsigned char> positive(layer.mask.size() * static_cast<std::size_t>(area), 0);
         for (const auto& match : assignments[index]) positive[static_cast<std::size_t>(match.anchor) * area + match.cell] = 1;
@@ -102,16 +123,10 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
             for (int cell = 0; cell < area; ++cell) {
                 if (positive[static_cast<std::size_t>(anchor) * area + cell]) continue;
                 if (layer.ignore_thresh < 1.0f && !targets.empty()) {
-                    // Decode this (anchor, cell)'s predicted box (same math as network.cpp's
-                    // decode()) and skip the negative push if it already overlaps some ground
+                    // Skip the negative push if this predicted box already overlaps some ground
                     // truth by >= ignore_thresh: it is a near-miss the model should keep refining,
                     // not be told is definitely background (Darknet's ignore_thresh rule).
-                    int x = cell % layer.output.w, y = cell / layer.output.w;
-                    auto [aw, ah] = layer.anchors[static_cast<std::size_t>(layer.mask[static_cast<std::size_t>(anchor)])];
-                    float px = (sigmoid(output[index][pos(anchor, 0, cell)]) + x) * input.w / layer.output.w;
-                    float py = (sigmoid(output[index][pos(anchor, 1, cell)]) + y) * input.h / layer.output.h;
-                    float pw = std::exp(std::clamp(output[index][pos(anchor, 2, cell)], -20.0f, 20.0f)) * aw;
-                    float ph = std::exp(std::clamp(output[index][pos(anchor, 3, cell)], -20.0f, 20.0f)) * ah;
+                    auto [px, py, pw, ph] = decode_box(anchor, cell);
                     float best = 0;
                     for (const auto& target : targets)
                         best = std::max(best, box_iou(px, py, pw, ph, target.cx * input.w, target.cy * input.h,
@@ -119,13 +134,20 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
                     if (best >= layer.ignore_thresh) continue;
                 }
                 auto p = pos(anchor, 4, cell);
-                loss += binary_cross_entropy(output[index][p], 0.0f);
-                gradient[index][p] += sigmoid(output[index][p]);
+                loss += layer.noobject_scale * binary_cross_entropy(output[index][p], 0.0f);
+                gradient[index][p] += layer.noobject_scale * sigmoid(output[index][p]);
             }
         for (const auto& match : assignments[index]) {
             auto obj = pos(match.anchor, 4, match.cell);
-            loss += binary_cross_entropy(output[index][obj], 1.0f);
-            gradient[index][obj] += sigmoid(output[index][obj]) - 1.0f;
+            // region's `rescore` (Darknet region_layer.c) uses this predicted box's actual IoU
+            // with its matched truth as the objectness target instead of a flat 1.
+            float obj_target = 1.0f;
+            if (is_region && layer.rescore) {
+                auto [px, py, pw, ph] = decode_box(match.anchor, match.cell);
+                obj_target = box_iou(px, py, pw, ph, match.truth_cx, match.truth_cy, match.truth_w, match.truth_h);
+            }
+            loss += layer.object_scale * binary_cross_entropy(output[index][obj], obj_target);
+            gradient[index][obj] += layer.object_scale * (sigmoid(output[index][obj]) - obj_target);
             for (int attr = 0; attr < 2; ++attr) {
                 float wanted = attr == 0 ? match.offset_x : match.offset_y;
                 auto p = pos(match.anchor, attr, match.cell);
@@ -138,6 +160,26 @@ YoloLossResult yolo_loss_and_gradient(const Network& network, const std::vector<
                 float error = output[index][p] - wanted;
                 loss += 0.5f * match.box_scale * error * error;
                 gradient[index][p] += match.box_scale * error;
+            }
+            if (is_region) {
+                // Softmax + cross-entropy class loss (Darknet region_layer.c's delta_region_class),
+                // unlike yolo's independent per-class BCE below: gradient is (prob[c] - onehot[c]),
+                // the standard softmax/cross-entropy derivative w.r.t. the raw class logit.
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (int cls = 0; cls < layer.classes; ++cls) maximum = std::max(maximum, output[index][pos(match.anchor, 5 + cls, match.cell)]);
+                float total = 0.0f;
+                std::vector<float> prob(static_cast<std::size_t>(layer.classes));
+                for (int cls = 0; cls < layer.classes; ++cls) {
+                    prob[static_cast<std::size_t>(cls)] = std::exp(output[index][pos(match.anchor, 5 + cls, match.cell)] - maximum);
+                    total += prob[static_cast<std::size_t>(cls)];
+                }
+                for (int cls = 0; cls < layer.classes; ++cls) prob[static_cast<std::size_t>(cls)] /= total;
+                loss += layer.class_scale * -std::log(std::max(prob[static_cast<std::size_t>(match.class_id)], 1e-8f));
+                for (int cls = 0; cls < layer.classes; ++cls) {
+                    float wanted = cls == match.class_id ? 1.0f : 0.0f;
+                    gradient[index][pos(match.anchor, 5 + cls, match.cell)] += layer.class_scale * (prob[static_cast<std::size_t>(cls)] - wanted);
+                }
+                continue;
             }
             for (int cls = 0; cls < layer.classes; ++cls) {
                 float wanted = cls == match.class_id ? 1.0f : 0.0f;

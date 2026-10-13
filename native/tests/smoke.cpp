@@ -210,6 +210,39 @@ int main() {
         }
 #endif
 
+        // Region (YOLOv2-style) head: unlike yolo's independent per-class sigmoid, class score is
+        // objectness * softmax(class logits). anchor 0/cell 0 gets a confident box (high
+        // objectness, class0 logit=2 vs class1 logit=0); every other (anchor, cell) stays at very
+        // negative objectness so only this one cell's class0 clears the 0.5 threshold (class1's
+        // softmax share is ~0.12, below it).
+        const auto region_cfg = std::filesystem::path(__FILE__).parent_path() / "region.cfg";
+        auto region_net = detector::Network::from_cfg(region_cfg.string());
+        expect(region_net.layers()[0].output.c == 14, "region layer shape");
+        std::vector<float> region_raw(224, -10.0f);
+        auto region_pos = [](int anchor, int attr, int cell) { return static_cast<std::size_t>((anchor * 7 + attr) * 16 + cell); };
+        region_raw[region_pos(0, 0, 0)] = 0.0f;   // x -> sigmoid(0)=0.5
+        region_raw[region_pos(0, 1, 0)] = 0.0f;   // y -> sigmoid(0)=0.5
+        region_raw[region_pos(0, 2, 0)] = 0.0f;   // w -> exp(0)*anchor_w=2
+        region_raw[region_pos(0, 3, 0)] = 0.0f;   // h -> exp(0)*anchor_h=2
+        region_raw[region_pos(0, 4, 0)] = 10.0f;  // objectness -> sigmoid(10) ~ 0.99995
+        region_raw[region_pos(0, 5, 0)] = 2.0f;   // class0 logit
+        region_raw[region_pos(0, 6, 0)] = 0.0f;   // class1 logit
+        auto region_heads = region_net.forward(region_raw, detector::Backend::cpu);
+        expect(region_heads.size() == 1 && region_heads[0].values.size() == 224, "region head shape");
+        auto region_boxes = detector::decode(region_net, region_heads, 0.5f, 0.45f);
+        expect(region_boxes.size() == 1, "region decode: only class0 at (anchor0, cell0) should clear threshold");
+        expect(region_boxes[0].class_id == 0, "region decode class id");
+        expect(region_boxes[0].score > 0.87f && region_boxes[0].score < 0.89f, "region softmax*objectness score");
+        expect(std::abs(region_boxes[0].x1 - (-0.5f)) < 1e-4f && std::abs(region_boxes[0].x2 - 1.5f) < 1e-4f,
+               "region decoded box geometry");
+#ifdef DETECTOR_HAS_CUDA
+        if (devices > 0) {
+            auto region_gpu = region_net.forward(region_raw, detector::Backend::cuda);
+            for (std::size_t i = 0; i < region_heads[0].values.size(); ++i)
+                expect(std::abs(region_gpu[0].values[i] - region_heads[0].values[i]) < 1e-4f, "region CPU/CUDA parity");
+        }
+#endif
+
         std::cout << "detector smoke tests passed\n";
         return 0;
     } catch (const std::exception& error) {

@@ -144,6 +144,10 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
         if (shape.c != static_cast<int>(layer.mask.size()) * (layer.classes + 5))
             throw std::runtime_error("yolo channels must equal mask count * (classes + 5)");
         return shape;
+    case Kind::region:
+        if (shape.c != static_cast<int>(layer.anchors.size()) * (layer.classes + 5))
+            throw std::runtime_error("region channels must equal anchor count * (classes + 5)");
+        return shape;
     }
     throw std::runtime_error("unsupported layer kind");
 }
@@ -384,6 +388,36 @@ Network Network::from_cfg(const std::string& path) {
             layer.ignore_thresh = floating(section, "ignore_thresh", "0.7");
             if (!(layer.ignore_thresh > 0.0f && layer.ignore_thresh <= 1.0f))
                 throw std::runtime_error("ignore_thresh must be in (0,1]");
+        } else if (section.name == "region") {
+            // YOLOv2-style head (Darknet's region_layer.c): every anchor applies to every cell (no
+            // [yolo]-style mask subset), class probabilities use softmax+cross-entropy (this
+            // project always takes Darknet's `softmax=1` branch - the rare independent-logistic
+            // `softmax=0` variant is not supported), and `bias_match` is always effectively 1
+            // (shape-only anchor matching), matching this project's existing yolo anchor
+            // assignment; Darknet's rarely-used position-aware bias_match=0, `absolute` and
+            // `random`/`jitter` cfg knobs (superseded by this project's own --multiscale/--*-jitter
+            // CLI flags) are parsed-and-ignored simplifications, not supported.
+            layer.kind = Kind::region;
+            layer.classes = integer(section, "classes");
+            positive(layer.classes, "classes");
+            int num = integer(section, "num", "1");
+            positive(num, "num");
+            auto anchors = list(section, "anchors");
+            if (anchors.size() % 2) throw std::runtime_error("anchors require width,height pairs");
+            if (static_cast<int>(anchors.size()) != 2 * num) throw std::runtime_error("region anchors must have num pairs");
+            for (std::size_t a = 0; a < anchors.size(); a += 2) {
+                positive(anchors[a], "anchor width"); positive(anchors[a + 1], "anchor height");
+                layer.anchors.emplace_back(static_cast<float>(anchors[a]), static_cast<float>(anchors[a + 1]));
+            }
+            for (int slot = 0; slot < num; ++slot) layer.mask.push_back(slot);  // identity: all anchors active
+            layer.ignore_thresh = floating(section, "thresh", "0.5");
+            if (!(layer.ignore_thresh > 0.0f && layer.ignore_thresh <= 1.0f))
+                throw std::runtime_error("thresh must be in (0,1]");
+            layer.rescore = integer(section, "rescore", "0") != 0;
+            layer.object_scale = floating(section, "object_scale", "1");
+            layer.noobject_scale = floating(section, "noobject_scale", "1");
+            layer.class_scale = floating(section, "class_scale", "1");
+            layer.coord_scale = floating(section, "coord_scale", "1");
         } else {
             throw std::runtime_error("unsupported layer [" + section.name + "] at line " + std::to_string(section.line));
         }
@@ -393,9 +427,10 @@ Network Network::from_cfg(const std::string& path) {
         net.layers_.push_back(std::move(layer));
     }
     if (net.layers_.empty() ||
-        (std::none_of(net.layers_.begin(), net.layers_.end(), [](const Layer& layer) { return layer.kind == Kind::yolo; }) &&
+        (std::none_of(net.layers_.begin(), net.layers_.end(),
+                      [](const Layer& layer) { return layer.kind == Kind::yolo || layer.kind == Kind::region; }) &&
          net.layers_.back().kind != Kind::softmax))
-        throw std::runtime_error("cfg needs a [yolo] head or final [softmax]");
+        throw std::runtime_error("cfg needs a [yolo]/[region] head or final [softmax]");
     return net;
 }
 
@@ -492,7 +527,9 @@ std::vector<Detection> decode(const Network& net, const std::vector<Head>& heads
     for (const auto& head : heads) {
         if (head.layer >= net.layers().size()) throw std::runtime_error("invalid YOLO head index");
         const auto& layer = net.layers()[head.layer];
-        if (layer.kind != Kind::yolo || head.values.size() != layer.output.elements()) throw std::runtime_error("invalid YOLO head tensor");
+        bool is_region = layer.kind == Kind::region;
+        if ((layer.kind != Kind::yolo && !is_region) || head.values.size() != layer.output.elements())
+            throw std::runtime_error("invalid YOLO/region head tensor");
         int area = layer.output.h * layer.output.w;
         int attributes = layer.classes + 5;
         auto at = [&](int anchor, int attr, int cell) {
@@ -509,6 +546,24 @@ std::vector<Detection> decode(const Network& net, const std::vector<Head>& heads
                     float cy = (sigmoid(at(a, 1, cell)) + y) * input.h / layer.output.h;
                     float width = std::exp(std::clamp(at(a, 2, cell), -20.0f, 20.0f)) * anchor_w;
                     float height = std::exp(std::clamp(at(a, 3, cell), -20.0f, 20.0f)) * anchor_h;
+                    if (is_region) {
+                        // Softmax (not independent per-class sigmoid) class scores, matching
+                        // Darknet's region_layer.c; class score = objectness * softmax probability.
+                        float maximum = -std::numeric_limits<float>::infinity();
+                        for (int cls = 0; cls < layer.classes; ++cls) maximum = std::max(maximum, at(a, 5 + cls, cell));
+                        float total = 0.0f;
+                        std::vector<float> prob(static_cast<std::size_t>(layer.classes));
+                        for (int cls = 0; cls < layer.classes; ++cls) {
+                            prob[static_cast<std::size_t>(cls)] = std::exp(at(a, 5 + cls, cell) - maximum);
+                            total += prob[static_cast<std::size_t>(cls)];
+                        }
+                        for (int cls = 0; cls < layer.classes; ++cls) {
+                            float score = objectness * prob[static_cast<std::size_t>(cls)] / total;
+                            if (score >= threshold) boxes.push_back({cls, score, cx - width / 2, cy - height / 2,
+                                                                      cx + width / 2, cy + height / 2});
+                        }
+                        continue;
+                    }
                     for (int cls = 0; cls < layer.classes; ++cls) {
                         float score = objectness * sigmoid(at(a, 5 + cls, cell));
                         if (score >= threshold) boxes.push_back({cls, score, cx - width / 2, cy - height / 2,

@@ -246,6 +246,15 @@ int main() {
 
         check_dropout_runs((directory / "dropout-train.cfg").string(), {0.4f}, {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 20);
 
+        // Region has no learnable parameters of its own and no randomness (rescore just decodes
+        // the deterministic forward output), so like reorg it fits the exact CPU/GPU parity
+        // harness directly - this is the decisive cross-check that CudaTrainer's region dispatch
+        // (host-side yolo_loss_and_gradient call, same as yolo) produces identical gradients to
+        // the CPU trainer's softmax/rescore/scale-knob code paths.
+        std::vector<float> region_input(detector::Network::from_cfg((directory / "region-train.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < region_input.size(); ++i) region_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        check_parity((directory / "region-train.cfg").string(), region_input, {{1, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 1, "region");
+
         std::cout << "cuda training smoke passed\n";
         return 0;
 #else

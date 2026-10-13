@@ -15,7 +15,7 @@ struct Shape {
     std::size_t elements() const;
 };
 
-enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg };
+enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region };
 enum class Backend { cpu, cuda, tensorrt };
 
 struct Layer {
@@ -35,6 +35,18 @@ struct Layer {
     float dropout_probability = 0.5f;  // dropout layers only: fraction of activations zeroed during
                                         // training (inverted dropout - kept activations scaled by
                                         // 1/(1-p)); a no-op at inference, matching Darknet.
+    // region layers only (YOLOv2-style head: all `anchors` apply to every cell, no mask subset -
+    // `mask` is populated as the identity [0..anchors.size()) at parse time so the shared
+    // yolo/region assignment and decode code can treat both kinds uniformly). `rescore` makes the
+    // positive objectness target the predicted box's IoU with its matched truth instead of a flat
+    // 1 (Darknet's region_layer.c). The four scale fields default to 1 (neutral for `yolo` layers,
+    // which never set them) and weight negative/positive objectness, class and coordinate loss
+    // independently, matching Darknet's object_scale/noobject_scale/class_scale/coord_scale.
+    bool rescore = false;
+    float object_scale = 1.0f;
+    float noobject_scale = 1.0f;
+    float class_scale = 1.0f;
+    float coord_scale = 1.0f;
     std::vector<int> sources;
     std::vector<int> mask;
     std::vector<std::pair<float, float>> anchors;

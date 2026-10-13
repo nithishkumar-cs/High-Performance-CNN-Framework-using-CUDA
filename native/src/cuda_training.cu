@@ -437,9 +437,9 @@ struct CudaTrainer::Impl {
         for (const auto& layer : layers)
             if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::route &&
                 layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo &&
-                layer.kind != Kind::dropout && layer.kind != Kind::reorg)
+                layer.kind != Kind::dropout && layer.kind != Kind::reorg && layer.kind != Kind::region)
                 throw std::runtime_error("CUDA detector training supports convolutional, maxpool, route, "
-                                          "upsample, shortcut, yolo, dropout and reorg layers only");
+                                          "upsample, shortcut, yolo, region, dropout and reorg layers only");
         // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
         // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
         // statistics (and every other per-sample forward/backward op) can run within one step().
@@ -619,7 +619,7 @@ struct CudaTrainer::Impl {
                         layer.input.c, layer.input.h, layer.input.w, layer.stride);
                     launch_check();
                 }
-            } else {  // yolo: pass-through, matching the CPU trainer's forward for terminal heads.
+            } else {  // yolo/region: pass-through, matching the CPU trainer's forward for terminal heads.
                 for (std::size_t s = 0; s < n; ++s)
                     check(cudaMemcpy(output[i] + s * elems, previous_of(s), elems * sizeof(float),
                                      cudaMemcpyDeviceToDevice), "cudaMemcpy yolo forward");
@@ -641,7 +641,7 @@ struct CudaTrainer::Impl {
         std::vector<std::vector<float>> host_output(layers.size()), host_gradient(layers.size());
         for (std::size_t s = 0; s < n; ++s) {
             for (std::size_t i = 0; i < layers.size(); ++i) {
-                if (layers[i].kind != Kind::yolo) continue;
+                if (layers[i].kind != Kind::yolo && layers[i].kind != Kind::region) continue;
                 std::size_t elems = layers[i].output.elements();
                 host_output[i].resize(elems);
                 check(cudaMemcpy(host_output[i].data(), output[i] + s * elems, elems * sizeof(float), cudaMemcpyDeviceToHost),
@@ -652,7 +652,7 @@ struct CudaTrainer::Impl {
             total_loss += loss_result.loss;
             total_positives += loss_result.positives;
             for (std::size_t i = 0; i < layers.size(); ++i) {
-                if (layers[i].kind != Kind::yolo) continue;
+                if (layers[i].kind != Kind::yolo && layers[i].kind != Kind::region) continue;
                 std::size_t elems = layers[i].output.elements();
                 check(cudaMemcpy(gradient[i] + s * elems, host_gradient[i].data(), elems * sizeof(float),
                                  cudaMemcpyHostToDevice), "cudaMemcpy yolo gradient");
@@ -670,7 +670,7 @@ struct CudaTrainer::Impl {
                 return (reverse ? output[reverse - 1] : input) + s * prev_elems;
             };
             auto prev_grad_of = [&](std::size_t s) -> float* { return gradient[reverse - 1] + s * prev_elems; };
-            if (layer.kind == Kind::yolo) {
+            if (layer.kind == Kind::yolo || layer.kind == Kind::region) {
                 if (reverse)
                     for (std::size_t s = 0; s < n; ++s) {
                         add_into<<<blocks_for(elements), kThreads>>>(prev_grad_of(s), gradient[reverse] + s * elems, elements);

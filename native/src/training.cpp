@@ -303,7 +303,7 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
     // into this trainer's buffers; the SGD update (divided by `n`) is applied once below.
     for (std::size_t reverse = num_layers; reverse-- > 0;) {
         auto& layer = layers[reverse];
-        if (layer.kind == Kind::yolo) {
+        if (layer.kind == Kind::yolo || layer.kind == Kind::region) {
             if (reverse)
                 for (std::size_t s = 0; s < n; ++s)
                     for (std::size_t p = 0; p < gradient[s][reverse].size(); ++p) gradient[s][reverse - 1][p] += gradient[s][reverse][p];

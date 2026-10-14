@@ -68,9 +68,10 @@ float LearningRateSchedule::at(int iteration) const {
 }
 
 Trainer::Trainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay,
-                  float momentum, float bn_momentum)
+                  float momentum, float bn_momentum, int initial_iteration)
     : network_(network), schedule_(std::move(schedule)), batch_size_(batch_size), weight_decay_(weight_decay),
-      momentum_(momentum), bn_momentum_(bn_momentum) {
+      momentum_(momentum), bn_momentum_(bn_momentum), iteration_(initial_iteration) {
+    if (initial_iteration < 0) throw std::runtime_error("invalid initial iteration");
     if (!std::isfinite(schedule_.base_lr) || schedule_.base_lr <= 0 || schedule_.burn_in < 0 ||
         schedule_.steps.size() != schedule_.scales.size())
         throw std::runtime_error("invalid learning rate schedule");

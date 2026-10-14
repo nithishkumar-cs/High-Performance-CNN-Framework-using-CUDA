@@ -26,6 +26,12 @@ struct Options {
     std::string initial_weights;
     int init_layers = -1;  // -1: full load of initial_weights; >=0: partial/pretrained-backbone load
                             // (Darknet `partial N`) - random-init first, then overlay layers [0, N).
+    // Resumes a crashed/interrupted run: full-loads these weights (like --init with no
+    // --init-layers) AND seeds the LearningRateSchedule/epoch-loop step counter from the sidecar
+    // "<path>.step" file written alongside every checkpoint save, so burn-in/step-decay continues
+    // exactly instead of restarting at iteration 0 against already-trained weights. Mutually
+    // exclusive with --init/--init-layers.
+    std::string resume_from;
     int batch_size = 1;
     int burn_in = 0;
     std::vector<int> steps;
@@ -74,6 +80,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--seed") options.seed = static_cast<std::uint32_t>(std::stoul(value));
         else if (key == "--init") options.initial_weights = value;
         else if (key == "--init-layers") options.init_layers = std::stoi(value);
+        else if (key == "--resume-from") options.resume_from = value;
         else if (key == "--batch") options.batch_size = std::stoi(value);
         else if (key == "--burn-in") options.burn_in = std::stoi(value);
         else if (key == "--steps") options.steps = int_list(value);
@@ -93,6 +100,8 @@ Options options_from(int argc, char** argv) {
         throw std::runtime_error("invalid epochs or limit");
     if (options.init_layers >= 0 && options.initial_weights.empty())
         throw std::runtime_error("--init-layers requires --init");
+    if (!options.resume_from.empty() && (!options.initial_weights.empty() || options.init_layers >= 0))
+        throw std::runtime_error("--resume-from cannot be combined with --init or --init-layers");
     if (options.batch_size < 1) throw std::runtime_error("invalid batch size");
     if (options.steps.size() != options.scales.size())
         throw std::runtime_error("--steps and --scales must have the same length");
@@ -239,10 +248,15 @@ void letterbox_target(detector::Target& target, const detector::Letterbox& box, 
 // and whether its device-resident weights need syncing back to `network` before each checkpoint.
 // Samples are assembled into minibatches of `options.batch_size` (a smaller final batch per
 // epoch is fine) so step() computes true cross-sample batch-norm statistics, not per-sample ones.
+// `start_epoch` is the number of epochs already completed by a prior (crashed/interrupted) run
+// being resumed via --resume-from (0 for a fresh run); the loop continues toward the same
+// --epochs target total rather than restarting the epoch count from scratch. Per-epoch image
+// order is freshly shuffled regardless, so no image-in-epoch position needs to be restored -
+// only the completed-epoch count and (via the trainer's seeded iteration) the LR schedule step.
 template <typename TrainerT>
 void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::path>& images,
                 const fs::path& labels_dir, const fs::path& output_path, const Options& options,
-                std::mt19937& rng, bool sync_before_checkpoint) {
+                std::mt19937& rng, bool sync_before_checkpoint, int start_epoch = 0) {
     std::bernoulli_distribution flip_coin(options.flip_probability);
     std::uniform_real_distribution<float> exposure_dist(1.0f - options.exposure_jitter, 1.0f + options.exposure_jitter);
     std::uniform_real_distribution<float> saturation_dist(1.0f - options.saturation_jitter, 1.0f + options.saturation_jitter);
@@ -253,7 +267,7 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
     bool multiscale = options.multiscale_max > 0;
     std::uniform_int_distribution<int> multiscale_dist(options.multiscale_min / 32, options.multiscale_max / 32);
     int batches_done = 0;
-    for (int epoch = 1; epoch <= options.epochs; ++epoch) {
+    for (int epoch = start_epoch + 1; epoch <= options.epochs; ++epoch) {
         std::shuffle(images.begin(), images.end(), rng);
         double loss_sum = 0;
         std::size_t positives = 0;
@@ -297,6 +311,11 @@ void train_loop(TrainerT& trainer, detector::Network& network, std::vector<fs::p
         flush_batch();  // final, possibly smaller, partial batch
         if (sync_before_checkpoint) trainer.sync_to_network();
         network.save_weights(output_path.string());
+        // Sidecar "<iteration> <completed epochs>", read back by a later --resume-from run so the
+        // LearningRateSchedule and epoch loop continue exactly instead of restarting at iteration/
+        // epoch 0. Not part of the Darknet weights format itself, so it never affects
+        // compatibility with external Darknet.
+        std::ofstream(output_path.string() + ".step") << trainer.iteration() << ' ' << epoch << '\n';
         std::cout << "epoch=" << epoch << " mean_loss=" << loss_sum / images.size()
                   << " positives=" << positives << " lr=" << trainer.current_learning_rate()
                   << " checkpoint=" << output_path.string() << '\n';
@@ -325,18 +344,37 @@ int main(int argc, char** argv) {
     try {
         if (argc < 5) {
             std::cerr << "Usage: cuda_detector_train <cfg> <images_dir> <labels_dir> <output.weights> "
-                         "[--init weights] [--init-layers N] [--epochs 1] [--lr 0.0001] [--decay 0.0005] [--momentum 0.9] [--seed 2026] [--limit N] "
+                         "[--init weights] [--init-layers N] [--resume-from weights] [--epochs 1] [--lr 0.0001] "
+                         "[--decay 0.0005] [--momentum 0.9] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
                          "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
                          "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda] "
-                         "[--multiscale-min N] [--multiscale-max N] [--multiscale-interval 10]\n";
+                         "[--multiscale-min N] [--multiscale-max N] [--multiscale-interval 10]\n"
+                         "  --resume-from: full-loads <weights> and its sidecar \"<weights>.step\" (written "
+                         "alongside every checkpoint save) to continue the LR schedule/epoch loop exactly, "
+                         "instead of restarting it at iteration 0 like --init does; mutually exclusive with "
+                         "--init/--init-layers.\n";
             return 2;
         }
         auto options = options_from(argc, argv);
         fs::path output_path = argv[4];
         if (fs::exists(output_path)) throw std::runtime_error("refusing to overwrite existing output: " + output_path.string());
         auto network = detector::Network::from_cfg(argv[1]);
-        if (options.initial_weights.empty()) {
+        int initial_iteration = 0;
+        int start_epoch = 0;
+        if (!options.resume_from.empty()) {
+            network.load_weights(options.resume_from);
+            fs::path step_path = options.resume_from + ".step";
+            std::ifstream step_file(step_path);
+            long long saved_step = -1, saved_epoch = -1;
+            if (!step_file || !(step_file >> saved_step >> saved_epoch) || saved_step < 0 || saved_epoch < 0)
+                throw std::runtime_error("--resume-from requires a valid sidecar step file: " + step_path.string());
+            initial_iteration = static_cast<int>(saved_step);
+            start_epoch = static_cast<int>(saved_epoch);
+            if (start_epoch >= options.epochs)
+                throw std::runtime_error("nothing to resume: checkpoint already completed " +
+                                          std::to_string(start_epoch) + " of --epochs " + std::to_string(options.epochs));
+        } else if (options.initial_weights.empty()) {
             network.initialize_random(options.seed);
         } else if (options.init_layers < 0) {
             network.load_weights(options.initial_weights);
@@ -363,14 +401,18 @@ int main(int argc, char** argv) {
                   << " multiscale_interval=" << options.multiscale_interval << "\n";
         if (options.backend == "cuda") {
 #ifdef DETECTOR_HAS_CUDA
-            detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay, options.momentum);
-            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/true);
+            detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay, options.momentum,
+                                           0.99f, initial_iteration);
+            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/true,
+                       start_epoch);
 #else
             throw std::runtime_error("--backend cuda requires a build with -DDETECTOR_CUDA=ON");
 #endif
         } else {
-            detector::Trainer trainer(network, schedule, options.batch_size, options.decay, options.momentum);
-            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/false);
+            detector::Trainer trainer(network, schedule, options.batch_size, options.decay, options.momentum,
+                                       0.99f, initial_iteration);
+            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/false,
+                       start_epoch);
         }
         return 0;
     } catch (const std::exception& error) {

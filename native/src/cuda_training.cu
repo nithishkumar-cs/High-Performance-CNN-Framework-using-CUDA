@@ -410,7 +410,7 @@ struct CudaTrainer::Impl {
     float weight_decay;
     float momentum;
     float bn_momentum;
-    int iteration = 0;
+    int iteration;
     DeviceMemory memory;
     float* input = nullptr;
     std::vector<float*> output, preactivation, gradient;
@@ -420,14 +420,16 @@ struct CudaTrainer::Impl {
     std::vector<float*> weight_velocity, bias_velocity, scale_velocity;
     std::vector<int*> max_index;
 
-    Impl(Network& net, LearningRateSchedule sched, int batch, float decay, float sgd_momentum, float bn_mom)
+    Impl(Network& net, LearningRateSchedule sched, int batch, float decay, float sgd_momentum, float bn_mom,
+         int initial_iteration)
         : network(net), schedule(std::move(sched)), batch_size(batch), weight_decay(decay), momentum(sgd_momentum),
-          bn_momentum(bn_mom) {
+          bn_momentum(bn_mom), iteration(initial_iteration) {
         if (!std::isfinite(schedule.base_lr) || schedule.base_lr <= 0 || schedule.burn_in < 0 ||
             schedule.steps.size() != schedule.scales.size())
             throw std::runtime_error("invalid learning rate schedule");
         if (!std::isfinite(decay) || decay < 0) throw std::runtime_error("invalid weight decay");
         if (batch < 1) throw std::runtime_error("invalid batch size");
+        if (initial_iteration < 0) throw std::runtime_error("invalid initial iteration");
         if (!std::isfinite(sgd_momentum) || sgd_momentum < 0 || sgd_momentum >= 1) throw std::runtime_error("invalid momentum");
         if (!std::isfinite(bn_mom) || bn_mom <= 0 || bn_mom >= 1) throw std::runtime_error("invalid batch-norm momentum");
         int devices = 0;
@@ -822,13 +824,15 @@ struct CudaTrainer::Impl {
 };
 
 CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay,
-                          float momentum, float bn_momentum)
-    : impl_(std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, momentum, bn_momentum)) {}
+                          float momentum, float bn_momentum, int initial_iteration)
+    : impl_(std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, momentum, bn_momentum,
+                                    initial_iteration)) {}
 CudaTrainer::~CudaTrainer() = default;
 TrainResult CudaTrainer::step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
     return impl_->step(inputs, targets);
 }
 float CudaTrainer::current_learning_rate() const { return impl_->current_learning_rate(); }
+int CudaTrainer::iteration() const { return impl_->iteration; }
 void CudaTrainer::sync_to_network() { impl_->sync_to_network(); }
 void CudaTrainer::resize(int width, int height) { impl_->resize(width, height); }
 

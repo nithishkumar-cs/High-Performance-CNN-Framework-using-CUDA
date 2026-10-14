@@ -48,13 +48,21 @@ struct LearningRateSchedule {
 // exact loss or augmentation pipeline.
 class Trainer {
 public:
+    // `initial_iteration` seeds the step counter the LearningRateSchedule is keyed on (and that
+    // a saved checkpoint's sidecar .step file records) - lets a relaunched run resume exactly
+    // where a prior run's schedule/epoch loop left off instead of restarting burn-in/step-decay
+    // from iteration 0 against a checkpoint's already-trained weights.
     explicit Trainer(Network& network, LearningRateSchedule schedule, int batch_size = 1,
-                      float weight_decay = 0.0005f, float momentum = 0.9f, float bn_momentum = 0.99f);
+                      float weight_decay = 0.0005f, float momentum = 0.9f, float bn_momentum = 0.99f,
+                      int initial_iteration = 0);
     // `inputs.size()` must be between 1 and the constructor's `batch_size` inclusive; `targets`
     // must have the same length, one target list per sample.
     TrainResult step(const std::vector<std::vector<float>>& inputs,
                       const std::vector<std::vector<Target>>& targets);
     float current_learning_rate() const { return schedule_.at(iteration_); }
+    // Current step count (number of step() calls applied so far, seeded by `initial_iteration`);
+    // saved alongside the checkpoint so a later --resume-from run can continue the schedule exactly.
+    int iteration() const { return iteration_; }
     // No-op: Trainer's weights already live on `network`. Lets callers that are generic over
     // Trainer and CudaTrainer (which does need this to copy device weights back) call it unconditionally.
     void sync_to_network() {}

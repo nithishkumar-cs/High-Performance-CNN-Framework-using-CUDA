@@ -316,6 +316,50 @@ int main() {
                    "momentum did not carry velocity between steps as expected");
         }
 
+        // Resume support (train_main.cpp's --resume-from): a Trainer seeded with a saved
+        // `initial_iteration` must continue the LearningRateSchedule (burn-in then step-decay)
+        // at exactly the iteration a prior, now-destroyed Trainer reached, not restart it at 0 -
+        // the bug this feature fixes. Compares an uninterrupted 5-step run's LR-per-step sequence
+        // and final weights against a simulated crash-and-resume: 2 steps, capture iteration()
+        // (what the sidecar .step file would hold), then a *new* Trainer instance (as a relaunched
+        // process creates) seeded with that iteration finishes the remaining 3 steps.
+        {
+            detector::LearningRateSchedule resume_schedule{0.1f, 2, 4.0f, {4}, {0.5f}};
+            auto resume_cfg = (directory / "train-mini.cfg").string();
+            std::vector<float> resume_input{1.0f, 0.5f, 0.25f};
+            std::vector<detector::Target> resume_targets{{0, 0.5f, 0.5f, 0.5f, 0.5f}};
+
+            auto net_cont = detector::Network::from_cfg(resume_cfg);
+            net_cont.initialize_random(31);
+            detector::Trainer cont(net_cont, resume_schedule, 1, 0.0f, 0.0f);
+            std::vector<float> continuous_lrs;
+            for (int i = 0; i < 5; ++i) {
+                continuous_lrs.push_back(cont.current_learning_rate());
+                cont.step({resume_input}, {resume_targets});
+            }
+            float continuous_weight = net_cont.layer(0).weights[0];
+
+            auto net_resumed = detector::Network::from_cfg(resume_cfg);
+            net_resumed.initialize_random(31);
+            detector::Trainer first_half(net_resumed, resume_schedule, 1, 0.0f, 0.0f);
+            for (int i = 0; i < 2; ++i) first_half.step({resume_input}, {resume_targets});
+            int saved_iteration = first_half.iteration();
+            expect(saved_iteration == 2, "iteration() did not count completed step() calls");
+
+            detector::Trainer second_half(net_resumed, resume_schedule, 1, 0.0f, 0.0f, 0.99f, saved_iteration);
+            std::vector<float> resumed_lrs(continuous_lrs.begin(), continuous_lrs.begin() + 2);
+            for (int i = 2; i < 5; ++i) {
+                resumed_lrs.push_back(second_half.current_learning_rate());
+                second_half.step({resume_input}, {resume_targets});
+            }
+            for (int i = 0; i < 5; ++i)
+                expect(std::abs(resumed_lrs[i] - continuous_lrs[i]) < 1e-9f,
+                       "resumed LR sequence diverged from an uninterrupted run");
+            expect(second_half.iteration() == cont.iteration(), "resumed iteration count did not reach the uninterrupted run's count");
+            expect(std::abs(net_resumed.layer(0).weights[0] - continuous_weight) < 1e-5f,
+                   "resumed training did not reproduce the uninterrupted run's final weights");
+        }
+
         std::cout << "training smoke passed: first=" << first << " last=" << last << '\n';
         return 0;
     } catch (const std::exception& error) {

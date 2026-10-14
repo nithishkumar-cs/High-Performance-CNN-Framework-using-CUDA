@@ -19,14 +19,19 @@ namespace detector {
 // sync_to_network() before Network::save_weights() to copy the learned weights back to host.
 class CudaTrainer {
 public:
+    // `initial_iteration` seeds the step counter the LearningRateSchedule is keyed on - see
+    // Trainer's matching parameter for the resume rationale.
     explicit CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size = 1,
-                          float weight_decay = 0.0005f, float momentum = 0.9f, float bn_momentum = 0.99f);
+                          float weight_decay = 0.0005f, float momentum = 0.9f, float bn_momentum = 0.99f,
+                          int initial_iteration = 0);
     ~CudaTrainer();
     CudaTrainer(const CudaTrainer&) = delete;
     CudaTrainer& operator=(const CudaTrainer&) = delete;
     TrainResult step(const std::vector<std::vector<float>>& inputs,
                       const std::vector<std::vector<Target>>& targets);
     float current_learning_rate() const;
+    // Current step count, matching Trainer::iteration() (see there for the resume rationale).
+    int iteration() const;
     void sync_to_network();
     // Darknet-style multiscale resize: changes the network's (and this trainer's device buffers')
     // input width/height between step() calls, preserving every learned parameter and all

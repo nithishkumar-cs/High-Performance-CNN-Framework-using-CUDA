@@ -824,9 +824,17 @@ struct CudaTrainer::Impl {
 };
 
 CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay,
-                          float momentum, float bn_momentum, int initial_iteration)
-    : impl_(std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, momentum, bn_momentum,
-                                    initial_iteration)) {}
+                          float momentum, float bn_momentum, int initial_iteration) {
+    // Must run before the first CUDA call creates the context. Default scheduling (cudaDeviceScheduleAuto)
+    // picks a host-thread busy-wait spin loop on this machine (few host threads vs. many logical CPUs),
+    // which pegs a full CPU core at ~100% for the whole multi-day training run for no throughput benefit -
+    // pure wasted heat that, in a laptop chassis sharing cooling between CPU and GPU, measurably worsens the
+    // GPU's own SW thermal-slowdown throttling over sustained runs (observed per-epoch time degrading from
+    // ~46min to ~12.4h over the YOLOv2 full-budget retrain). Blocking sync parks the host thread instead.
+    check(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), "cudaSetDeviceFlags");
+    impl_ = std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, momentum, bn_momentum,
+                                    initial_iteration);
+}
 CudaTrainer::~CudaTrainer() = default;
 TrainResult CudaTrainer::step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
     return impl_->step(inputs, targets);

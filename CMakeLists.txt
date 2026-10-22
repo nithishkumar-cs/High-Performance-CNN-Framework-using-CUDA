@@ -15,7 +15,7 @@ if(DETECTOR_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_sources(detector_core PRIVATE native/src/cuda_backend.cu native/src/cuda_classifier_trainer.cu
     native/src/cuda_training.cu)
-  target_link_libraries(detector_core PUBLIC CUDA::cudart)
+  target_link_libraries(detector_core PUBLIC CUDA::cudart CUDA::cublas)
   target_compile_definitions(detector_core PUBLIC DETECTOR_HAS_CUDA=1)
   set_target_properties(detector_core PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
 endif()

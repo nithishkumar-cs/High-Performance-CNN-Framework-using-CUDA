@@ -20,3 +20,7 @@
 __pycache__/
 *.pyc
 .agent-work/
+
+# Local cuDNN install (pip-installed nvidia-cudnn-cu12 wheel contents, staged
+# for CMake's DETECTOR_CUDNN option) - third-party binaries/headers, never versioned.
+/third_party/

@@ -4,6 +4,7 @@ project(cuda_detector LANGUAGES CXX)
 option(DETECTOR_CUDA "Build the native CUDA inference backend" OFF)
 option(DETECTOR_OPENCV "Read JPEG and PNG images with OpenCV" OFF)
 option(DETECTOR_TENSORRT "Build the optional TensorRT inference backend" OFF)
+option(DETECTOR_CUDNN "Build the optional cuDNN-accelerated CUDA kernels" OFF)
 
 add_library(detector_core native/src/network.cpp native/src/image.cpp native/src/training.cpp
   native/src/yolo_loss.cpp native/src/classifier_trainer.cpp native/src/idx.cpp native/src/metrics.cpp)
@@ -18,6 +19,28 @@ if(DETECTOR_CUDA)
   target_link_libraries(detector_core PUBLIC CUDA::cudart CUDA::cublas)
   target_compile_definitions(detector_core PUBLIC DETECTOR_HAS_CUDA=1)
   set_target_properties(detector_core PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
+endif()
+
+if(DETECTOR_CUDNN)
+  if(NOT DETECTOR_CUDA)
+    message(FATAL_ERROR "DETECTOR_CUDNN requires DETECTOR_CUDA=ON")
+  endif()
+  # No official cuDNN SDK install is required: CUDNN_ROOT defaults to the pip-installed
+  # nvidia-cudnn-cu12 wheel's headers/import-lib staged under third_party/cudnn (see
+  # third_party/cudnn/README.md for how that import lib was generated from the wheel's DLL,
+  # which ships with no .lib on Windows). Point CUDNN_ROOT elsewhere to use an official SDK install.
+  set(CUDNN_ROOT "${CMAKE_SOURCE_DIR}/third_party/cudnn" CACHE PATH "cuDNN install root (contains include/ and lib/)")
+  find_path(CUDNN_INCLUDE_DIR cudnn.h PATHS ${CUDNN_ROOT}/include REQUIRED)
+  find_library(CUDNN_LIBRARY cudnn PATHS ${CUDNN_ROOT}/lib REQUIRED)
+  target_sources(detector_core PRIVATE native/src/cudnn_backend.cu)
+  target_include_directories(detector_core PRIVATE ${CUDNN_INCLUDE_DIR})
+  target_link_libraries(detector_core PUBLIC ${CUDNN_LIBRARY})
+  target_compile_definitions(detector_core PUBLIC DETECTOR_HAS_CUDNN=1)
+  # cuDNN's DLLs (staged under CUDNN_ROOT/bin, not on system PATH like the CUDA
+  # Toolkit's own DLLs) must sit next to any executable that loads them at runtime.
+  file(GLOB CUDNN_DLLS "${CUDNN_ROOT}/bin/*.dll")
+  add_custom_command(TARGET detector_core POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CUDNN_DLLS} "$<TARGET_FILE_DIR:detector_core>")
 endif()
 
 if(DETECTOR_TENSORRT)
@@ -81,6 +104,12 @@ if(BUILD_TESTING)
     add_executable(detector_cuda_training_tests native/tests/cuda_training_smoke.cpp)
     target_link_libraries(detector_cuda_training_tests PRIVATE detector_core)
     add_test(NAME detector_cuda_training_smoke COMMAND detector_cuda_training_tests)
+  endif()
+
+  if(DETECTOR_CUDNN)
+    add_executable(detector_cudnn_tests native/tests/cudnn_smoke.cpp)
+    target_link_libraries(detector_cudnn_tests PRIVATE detector_core)
+    add_test(NAME detector_cudnn_smoke COMMAND detector_cudnn_tests)
   endif()
 
   find_package(Python3 COMPONENTS Interpreter QUIET)

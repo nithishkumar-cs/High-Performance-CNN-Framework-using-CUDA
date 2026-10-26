@@ -7,7 +7,8 @@ option(DETECTOR_TENSORRT "Build the optional TensorRT inference backend" OFF)
 option(DETECTOR_CUDNN "Build the optional cuDNN-accelerated CUDA kernels" OFF)
 
 add_library(detector_core native/src/network.cpp native/src/image.cpp native/src/training.cpp
-  native/src/yolo_loss.cpp native/src/classifier_trainer.cpp native/src/idx.cpp native/src/metrics.cpp)
+  native/src/yolo_loss.cpp native/src/classifier_trainer.cpp native/src/idx.cpp native/src/metrics.cpp
+  native/src/recurrent.cpp)
 target_include_directories(detector_core PUBLIC native/include)
 target_compile_features(detector_core PUBLIC cxx_std_17)
 
@@ -95,6 +96,10 @@ if(BUILD_TESTING)
   add_executable(detector_classifier_tests native/tests/classifier_smoke.cpp)
   target_link_libraries(detector_classifier_tests PRIVATE detector_core)
   add_test(NAME detector_classifier_smoke COMMAND detector_classifier_tests)
+
+  add_executable(detector_recurrent_tests native/tests/recurrent_smoke.cpp)
+  target_link_libraries(detector_recurrent_tests PRIVATE detector_core)
+  add_test(NAME detector_recurrent_smoke COMMAND detector_recurrent_tests)
 
   add_executable(detector_idx_tests native/tests/idx_smoke.cpp)
   target_link_libraries(detector_idx_tests PRIVATE detector_core)

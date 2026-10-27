@@ -8,6 +8,7 @@
 
 # Native build products and local editor settings.
 /build/
+/build-cudnn/
 /cmake-build-*/
 *.exe
 *.obj

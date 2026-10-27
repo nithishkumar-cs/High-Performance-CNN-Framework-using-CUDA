@@ -42,6 +42,8 @@ struct Options {
     float hue_jitter = 0.0f;         // max hue shift as a fraction of the full circle, e.g. 0.1 => +-36 degrees
     float crop_jitter = 0.0f;        // max fraction of width/height cropped from each edge before letterboxing
     std::string backend = "cpu";
+    std::vector<int> gpus{0};
+    bool gpus_specified = false;
     // Darknet-style multiscale/resize-jitter training: every `multiscale_interval` completed
     // minibatches, resize the network to a new square dimension, a random multiple of 32 in
     // [multiscale_min, multiscale_max]. Disabled (default) when multiscale_max is 0.
@@ -91,6 +93,7 @@ Options options_from(int argc, char** argv) {
         else if (key == "--hue-jitter") options.hue_jitter = std::stof(value);
         else if (key == "--crop-jitter") options.crop_jitter = std::stof(value);
         else if (key == "--backend") options.backend = value;
+        else if (key == "--gpus") { options.gpus = int_list(value); options.gpus_specified = true; }
         else if (key == "--multiscale-min") options.multiscale_min = std::stoi(value);
         else if (key == "--multiscale-max") options.multiscale_max = std::stoi(value);
         else if (key == "--multiscale-interval") options.multiscale_interval = std::stoi(value);
@@ -117,6 +120,15 @@ Options options_from(int argc, char** argv) {
         throw std::runtime_error("invalid crop jitter");
     if (options.backend != "cpu" && options.backend != "cuda")
         throw std::runtime_error("--backend must be cpu or cuda");
+    if (options.gpus_specified && options.backend != "cuda")
+        throw std::runtime_error("--gpus requires --backend cuda");
+    if (options.gpus.empty() || std::any_of(options.gpus.begin(), options.gpus.end(), [](int id) { return id < 0; }))
+        throw std::runtime_error("--gpus requires non-negative CUDA device indices");
+    for (std::size_t i = 0; i < options.gpus.size(); ++i)
+        if (std::find(options.gpus.begin(), options.gpus.begin() + i, options.gpus[i]) != options.gpus.begin() + i)
+            throw std::runtime_error("--gpus requires distinct CUDA device indices");
+    if (options.gpus.size() > 1 && options.batch_size < static_cast<int>(options.gpus.size()))
+        throw std::runtime_error("--batch must be at least the number of selected GPUs");
     if (options.multiscale_min != 0 || options.multiscale_max != 0) {
         if (options.multiscale_min <= 0 || options.multiscale_max <= 0 || options.multiscale_min > options.multiscale_max ||
             options.multiscale_min % 32 != 0 || options.multiscale_max % 32 != 0)
@@ -348,7 +360,7 @@ int main(int argc, char** argv) {
                          "[--decay 0.0005] [--momentum 0.9] [--seed 2026] [--limit N] "
                          "[--batch 1] [--burn-in 0] [--steps s1,s2,...] [--scales f1,f2,...] "
                          "[--flip-probability 0.0] [--exposure-jitter 0.0] [--saturation-jitter 0.0] "
-                         "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda] "
+                         "[--hue-jitter 0.0] [--crop-jitter 0.0] [--backend cpu|cuda] [--gpus 0,1] "
                          "[--multiscale-min N] [--multiscale-max N] [--multiscale-interval 10]\n"
                          "  --resume-from: full-loads <weights> and its sidecar \"<weights>.step\" (written "
                          "alongside every checkpoint save) to continue the LR schedule/epoch loop exactly, "
@@ -398,13 +410,21 @@ int main(int argc, char** argv) {
                   << " hue_jitter=" << options.hue_jitter
                   << " crop_jitter=" << options.crop_jitter << " momentum=" << options.momentum
                   << " multiscale_min=" << options.multiscale_min << " multiscale_max=" << options.multiscale_max
-                  << " multiscale_interval=" << options.multiscale_interval << "\n";
+                   << " multiscale_interval=" << options.multiscale_interval
+                   << " gpu_count=" << (options.backend == "cuda" ? options.gpus.size() : 0) << "\n";
         if (options.backend == "cuda") {
 #ifdef DETECTOR_HAS_CUDA
-            detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay, options.momentum,
-                                           0.99f, initial_iteration);
-            train_loop(trainer, network, images, labels_dir, output_path, options, rng, /*sync_before_checkpoint=*/true,
-                       start_epoch);
+            if (options.gpus.size() == 1) {
+                detector::CudaTrainer trainer(network, schedule, options.batch_size, options.decay, options.momentum,
+                                               0.99f, initial_iteration, options.gpus[0]);
+                train_loop(trainer, network, images, labels_dir, output_path, options, rng,
+                           /*sync_before_checkpoint=*/true, start_epoch);
+            } else {
+                detector::MultiCudaTrainer trainer(network, schedule, options.batch_size, options.gpus,
+                                                    options.decay, options.momentum, 0.99f, initial_iteration);
+                train_loop(trainer, network, images, labels_dir, output_path, options, rng,
+                           /*sync_before_checkpoint=*/true, start_epoch);
+            }
 #else
             throw std::runtime_error("--backend cuda requires a build with -DDETECTOR_CUDA=ON");
 #endif

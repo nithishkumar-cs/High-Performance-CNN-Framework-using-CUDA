@@ -127,6 +127,9 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
         $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-linear.cfg)
     if(DETECTOR_CUDA)
+      add_test(NAME detector_cuda_gpu_selection
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_detector_gpu_selection.py
+          $<TARGET_FILE:cuda_detector_train> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/mini.cfg)
       add_test(NAME classifier_cli_cuda
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
           $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-linear.cfg --cuda)

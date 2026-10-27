@@ -211,6 +211,96 @@ void check_dropout_runs(const std::string& cfg, const std::vector<float>& input,
     expect(changed, "dropout CUDA training did not update weights");
 }
 
+/** Checks weighted model/velocity averaging against an unsplit batch without batch normalization. */
+void check_data_parallel_average(const std::string& cfg) {
+    auto left_net = detector::Network::from_cfg(cfg);
+    left_net.initialize_random(71);
+    auto right_net = left_net;
+    auto reference_net = left_net;
+    detector::LearningRateSchedule schedule{0.002f};
+    detector::CudaTrainer left(left_net, schedule, 2, 0.0005f, 0.9f, 0.99f, 0, 0);
+    detector::CudaTrainer right(right_net, schedule, 2, 0.0005f, 0.9f, 0.99f, 0, 0);
+    detector::CudaTrainer reference(reference_net, schedule, 3, 0.0005f, 0.9f, 0.99f, 0, 0);
+    std::vector<std::vector<float>> inputs(3, std::vector<float>(16));
+    for (std::size_t s = 0; s < inputs.size(); ++s)
+        for (std::size_t j = 0; j < inputs[s].size(); ++j)
+            inputs[s][j] = 0.1f + 0.02f * static_cast<float>((j + 3 * s) % 9);
+    std::vector<std::vector<detector::Target>> targets{
+        {{0, 0.5f, 0.5f, 0.25f, 0.25f}},
+        {{1, 0.4f, 0.6f, 0.3f, 0.3f}},
+        {{0, 0.7f, 0.3f, 0.2f, 0.2f}}};
+    auto compare = [&] {
+        left.sync_to_network();
+        right.sync_to_network();
+        reference.sync_to_network();
+        expect(left.iteration() == right.iteration() && left.iteration() == reference.iteration(),
+               "replica step counts differ");
+        for (std::size_t i = 0; i < reference_net.layers().size(); ++i) {
+            const auto& expected = reference_net.layers()[i];
+            const auto& a = left_net.layers()[i];
+            const auto& b = right_net.layers()[i];
+            for (std::size_t j = 0; j < expected.weights.size(); ++j) {
+                expect(std::abs(a.weights[j] - expected.weights[j]) < 2e-5f,
+                       "weighted multi-GPU weight differs from full batch");
+                expect(std::abs(b.weights[j] - expected.weights[j]) < 2e-5f,
+                       "replica weights differ after synchronization");
+            }
+            for (std::size_t j = 0; j < expected.biases.size(); ++j) {
+                expect(std::abs(a.biases[j] - expected.biases[j]) < 2e-5f,
+                       "weighted multi-GPU bias differs from full batch");
+                expect(std::abs(b.biases[j] - expected.biases[j]) < 2e-5f,
+                       "replica biases differ after synchronization");
+            }
+        }
+    };
+    for (int step = 0; step < 2; ++step) {
+        left.step({inputs[0]}, {targets[0]});
+        right.step({inputs[1], inputs[2]}, {targets[1], targets[2]});
+        reference.step(inputs, targets);
+        detector::CudaTrainer::average_state({&left, &right}, {1, 2});
+        compare();
+    }
+    // A final partial batch can leave one replica idle; it still receives parameters,
+    // momentum and the global iteration before the next minibatch.
+    right.step({inputs[2]}, {targets[2]});
+    reference.step({inputs[2]}, {targets[2]});
+    detector::CudaTrainer::average_state({&left, &right}, {0, 1});
+    compare();
+    std::cout << "cuda_data_parallel_average passed\n";
+}
+
+/** Confirms the same averaging operation broadcasts trainable BN and inference statistics. */
+void check_data_parallel_batch_norm(const std::string& cfg) {
+    auto a_net = detector::Network::from_cfg(cfg);
+    a_net.initialize_random(72);
+    auto b_net = a_net;
+    detector::CudaTrainer a(a_net, detector::LearningRateSchedule{0.001f}, 1);
+    detector::CudaTrainer b(b_net, detector::LearningRateSchedule{0.001f}, 1);
+    std::vector<float> first(a_net.input_shape().elements(), 0.2f);
+    std::vector<float> second(first.size(), 0.7f);
+    a.step({first}, {{{0, 0.5f, 0.5f, 0.25f, 0.25f}}});
+    b.step({second}, {{{0, 0.5f, 0.5f, 0.25f, 0.25f}}});
+    a.sync_to_network();
+    b.sync_to_network();
+    const auto before_a = a_net.layers()[0];
+    const auto before_b = b_net.layers()[0];
+    detector::CudaTrainer::average_state({&a, &b}, {1, 1});
+    a.sync_to_network();
+    b.sync_to_network();
+    for (std::size_t i = 0; i < before_a.scales.size(); ++i) {
+        const float mean = (before_a.means[i] + before_b.means[i]) * 0.5f;
+        const float variance = (before_a.variances[i] + before_b.variances[i]) * 0.5f;
+        const float scale = (before_a.scales[i] + before_b.scales[i]) * 0.5f;
+        expect(std::abs(a_net.layers()[0].means[i] - mean) < 1e-6f, "BN mean average mismatch");
+        expect(std::abs(a_net.layers()[0].variances[i] - variance) < 1e-6f, "BN variance average mismatch");
+        expect(std::abs(a_net.layers()[0].scales[i] - scale) < 1e-6f, "BN scale average mismatch");
+        expect(std::abs(b_net.layers()[0].means[i] - mean) < 1e-6f, "BN replica mean mismatch");
+        expect(std::abs(b_net.layers()[0].variances[i] - variance) < 1e-6f, "BN replica variance mismatch");
+        expect(std::abs(b_net.layers()[0].scales[i] - scale) < 1e-6f, "BN replica scale mismatch");
+    }
+    std::cout << "cuda_data_parallel_bn_state passed\n";
+}
+
 }  // namespace
 
 int main() {
@@ -260,6 +350,8 @@ int main() {
         std::vector<float> region_input(detector::Network::from_cfg((directory / "region-train.cfg").string()).input_shape().elements());
         for (std::size_t i = 0; i < region_input.size(); ++i) region_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
         check_parity((directory / "region-train.cfg").string(), region_input, {{1, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 1, "region");
+        check_data_parallel_average((directory / "region-train.cfg").string());
+        check_data_parallel_batch_norm((directory / "mini.cfg").string());
 
         std::cout << "cuda training smoke passed\n";
         return 0;

@@ -183,6 +183,17 @@ YOLO inference path.
   parameter, and a convolution/maxpool prefix. A parity test found and fixed a maxpool path that
   incorrectly fell through to a weight update after backpropagation.
 
+**2026-10-27 — CUDA detector data parallelism.**
+- Added `--gpus 0,1` to run independent detector replicas on selected GPUs with balanced shards
+  of the total `--batch`. Each global step synchronizes learned weights, momentum and batch norm
+  running state, weighted by the actual samples on each device. Smaller final batches can leave a
+  replica idle without losing its step count or optimizer state.
+- A one-GPU test uses two logical CUDA trainers to compare a 1+2 shard split against an unsplit
+  three-sample minibatch through multiple momentum steps, then an idle-replica partial batch.
+  Separate checks cover batch norm state, explicit `--gpus 0` CLI training, and duplicate-device
+  rejection. This laptop has only one GPU; actual two-device throughput and behavior remain to be
+  measured on a multi-GPU host. Synchronization currently gathers tensors through host memory.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

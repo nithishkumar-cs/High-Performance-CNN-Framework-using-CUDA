@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -1037,6 +1038,27 @@ struct CudaTrainer::Impl {
 
     float current_learning_rate() const { return schedule.at(iteration); }
 
+    /** Lists persistent state in a stable order for cross-device averaging. */
+    std::vector<std::pair<float*, std::size_t>> state_buffers() const {
+        std::vector<std::pair<float*, std::size_t>> result;
+        const auto& layers = network.layers();
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& layer = layers[i];
+            if (layer.kind != Kind::convolutional) continue;
+            result.emplace_back(weights[i], layer.weights.size());
+            result.emplace_back(biases[i], layer.biases.size());
+            result.emplace_back(weight_velocity[i], layer.weights.size());
+            result.emplace_back(bias_velocity[i], layer.biases.size());
+            if (layer.batch_normalize) {
+                result.emplace_back(scales[i], layer.scales.size());
+                result.emplace_back(scale_velocity[i], layer.scales.size());
+                result.emplace_back(running_mean[i], layer.means.size());
+                result.emplace_back(running_variance[i], layer.variances.size());
+            }
+        }
+        return result;
+    }
+
     void sync_to_network() {
         const auto& layers = network.layers();
         for (std::size_t i = 0; i < layers.size(); ++i) {
@@ -1059,7 +1081,8 @@ struct CudaTrainer::Impl {
 };
 
 CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size, float weight_decay,
-                          float momentum, float bn_momentum, int initial_iteration) {
+                           float momentum, float bn_momentum, int initial_iteration, int device_id) {
+    if (device_id >= 0) check(cudaSetDevice(device_id), "cudaSetDevice training");
     // Must run before the first CUDA call creates the context. Default scheduling (cudaDeviceScheduleAuto)
     // picks a host-thread busy-wait spin loop on this machine (few host threads vs. many logical CPUs),
     // which pegs a full CPU core at ~100% for the whole multi-day training run for no throughput benefit -
@@ -1067,17 +1090,137 @@ CudaTrainer::CudaTrainer(Network& network, LearningRateSchedule schedule, int ba
     // GPU's own SW thermal-slowdown throttling over sustained runs (observed per-epoch time degrading from
     // ~46min to ~12.4h over the YOLOv2 full-budget retrain). Blocking sync parks the host thread instead.
     check(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync), "cudaSetDeviceFlags");
+    check(cudaGetDevice(&device_id_), "cudaGetDevice training");
     impl_ = std::make_unique<Impl>(network, std::move(schedule), batch_size, weight_decay, momentum, bn_momentum,
-                                    initial_iteration);
+                                     initial_iteration);
 }
-CudaTrainer::~CudaTrainer() = default;
+CudaTrainer::~CudaTrainer() {
+    if (impl_) {
+        cudaSetDevice(device_id_);
+        impl_.reset();
+    }
+}
 TrainResult CudaTrainer::step(const std::vector<std::vector<float>>& inputs, const std::vector<std::vector<Target>>& targets) {
+    check(cudaSetDevice(device_id_), "cudaSetDevice training step");
     return impl_->step(inputs, targets);
 }
 float CudaTrainer::current_learning_rate() const { return impl_->current_learning_rate(); }
 int CudaTrainer::iteration() const { return impl_->iteration; }
-void CudaTrainer::sync_to_network() { impl_->sync_to_network(); }
-void CudaTrainer::resize(int width, int height) { impl_->resize(width, height); }
+void CudaTrainer::sync_to_network() {
+    check(cudaSetDevice(device_id_), "cudaSetDevice training checkpoint");
+    impl_->sync_to_network();
+}
+void CudaTrainer::resize(int width, int height) {
+    check(cudaSetDevice(device_id_), "cudaSetDevice training resize");
+    impl_->resize(width, height);
+}
+
+/** Reduces each persistent tensor on the host and broadcasts the weighted result to every GPU. */
+void CudaTrainer::average_state(const std::vector<CudaTrainer*>& trainers,
+                                 const std::vector<std::size_t>& sample_counts) {
+    if (trainers.empty() || trainers.size() != sample_counts.size())
+        throw std::runtime_error("invalid CUDA trainer state average");
+    std::size_t total = 0;
+    int next_iteration = 0;
+    std::vector<std::vector<std::pair<float*, std::size_t>>> buffers;
+    buffers.reserve(trainers.size());
+    for (std::size_t i = 0; i < trainers.size(); ++i) {
+        if (!trainers[i]) throw std::runtime_error("null CUDA trainer in state average");
+        total += sample_counts[i];
+        next_iteration = std::max(next_iteration, trainers[i]->impl_->iteration);
+        buffers.push_back(trainers[i]->impl_->state_buffers());
+    }
+    if (total == 0) throw std::runtime_error("empty CUDA trainer state average");
+    for (std::size_t i = 0; i < trainers.size(); ++i) {
+        int expected = next_iteration - (sample_counts[i] == 0 ? 1 : 0);
+        if (trainers[i]->impl_->iteration != expected || buffers[i].size() != buffers[0].size())
+            throw std::runtime_error("CUDA trainers have incompatible state or step counts");
+    }
+    for (std::size_t tensor = 0; tensor < buffers[0].size(); ++tensor) {
+        const std::size_t count = buffers[0][tensor].second;
+        std::vector<double> sum(count, 0.0);
+        std::vector<float> values(count);
+        for (std::size_t i = 0; i < trainers.size(); ++i) {
+            if (buffers[i][tensor].second != count)
+                throw std::runtime_error("CUDA trainers have different tensor sizes");
+            if (sample_counts[i] == 0) continue;
+            check(cudaSetDevice(trainers[i]->device_id_), "cudaSetDevice state gather");
+            check(cudaMemcpy(values.data(), buffers[i][tensor].first, count * sizeof(float), cudaMemcpyDeviceToHost),
+                  "cudaMemcpy state gather");
+            const double weight = static_cast<double>(sample_counts[i]) / static_cast<double>(total);
+            for (std::size_t j = 0; j < count; ++j) sum[j] += weight * values[j];
+        }
+        for (std::size_t j = 0; j < count; ++j) values[j] = static_cast<float>(sum[j]);
+        for (std::size_t i = 0; i < trainers.size(); ++i) {
+            check(cudaSetDevice(trainers[i]->device_id_), "cudaSetDevice state broadcast");
+            check(cudaMemcpy(buffers[i][tensor].first, values.data(), count * sizeof(float), cudaMemcpyHostToDevice),
+                  "cudaMemcpy state broadcast");
+        }
+    }
+    for (auto* trainer : trainers) trainer->impl_->iteration = next_iteration;
+}
+
+/** Builds one independently allocated model replica and trainer per distinct selected GPU. */
+MultiCudaTrainer::MultiCudaTrainer(Network& network, LearningRateSchedule schedule, int batch_size,
+                                   std::vector<int> device_ids, float weight_decay, float momentum,
+                                   float bn_momentum, int initial_iteration)
+    : network_(network), batch_size_(batch_size) {
+    if (device_ids.size() < 2 || batch_size < static_cast<int>(device_ids.size()))
+        throw std::runtime_error("multi-GPU training requires at least two devices and batch >= GPU count");
+    int available = 0;
+    check(cudaGetDeviceCount(&available), "cudaGetDeviceCount multi-GPU");
+    for (std::size_t i = 0; i < device_ids.size(); ++i) {
+        if (device_ids[i] < 0 || device_ids[i] >= available ||
+            std::find(device_ids.begin(), device_ids.begin() + i, device_ids[i]) != device_ids.begin() + i)
+            throw std::runtime_error("--gpus must list distinct available CUDA device indices");
+    }
+    replicas_.reserve(device_ids.size() - 1);
+    for (std::size_t i = 1; i < device_ids.size(); ++i) replicas_.push_back(network);
+    trainers_.reserve(device_ids.size());
+    for (std::size_t i = 0; i < device_ids.size(); ++i)
+        trainers_.push_back(std::make_unique<CudaTrainer>(i == 0 ? network_ : replicas_[i - 1], schedule,
+            (batch_size + static_cast<int>(device_ids.size()) - 1) / static_cast<int>(device_ids.size()),
+            weight_decay, momentum, bn_momentum, initial_iteration, device_ids[i]));
+}
+
+/** Runs balanced shards concurrently, then averages by the actual sample count of each shard. */
+TrainResult MultiCudaTrainer::step(const std::vector<std::vector<float>>& inputs,
+                                   const std::vector<std::vector<Target>>& targets) {
+    if (inputs.empty() || inputs.size() > static_cast<std::size_t>(batch_size_) || inputs.size() != targets.size())
+        throw std::runtime_error("invalid multi-GPU detector minibatch");
+    const std::size_t workers = trainers_.size();
+    std::vector<std::size_t> counts(workers, 0);
+    std::vector<std::future<TrainResult>> jobs(workers);
+    for (std::size_t i = 0; i < workers; ++i) {
+        const std::size_t begin = inputs.size() * i / workers;
+        const std::size_t end = inputs.size() * (i + 1) / workers;
+        counts[i] = end - begin;
+        if (!counts[i]) continue;
+        jobs[i] = std::async(std::launch::async, [&, i, begin, end] {
+            std::vector<std::vector<float>> local_inputs(inputs.begin() + begin, inputs.begin() + end);
+            std::vector<std::vector<Target>> local_targets(targets.begin() + begin, targets.begin() + end);
+            return trainers_[i]->step(local_inputs, local_targets);
+        });
+    }
+    TrainResult result{};
+    for (std::size_t i = 0; i < workers; ++i) {
+        if (!counts[i]) continue;
+        auto local = jobs[i].get();
+        result.loss += local.loss;
+        result.positives += local.positives;
+    }
+    std::vector<CudaTrainer*> raw;
+    for (auto& trainer : trainers_) raw.push_back(trainer.get());
+    CudaTrainer::average_state(raw, counts);
+    return result;
+}
+
+float MultiCudaTrainer::current_learning_rate() const { return trainers_[0]->current_learning_rate(); }
+int MultiCudaTrainer::iteration() const { return trainers_[0]->iteration(); }
+void MultiCudaTrainer::sync_to_network() { trainers_[0]->sync_to_network(); }
+void MultiCudaTrainer::resize(int width, int height) {
+    for (auto& trainer : trainers_) trainer->resize(width, height);
+}
 
 }  // namespace detector
 #endif

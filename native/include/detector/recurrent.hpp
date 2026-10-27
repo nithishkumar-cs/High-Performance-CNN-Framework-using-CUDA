@@ -3,15 +3,8 @@
 #include <cstddef>
 #include <vector>
 
-// Standalone RNN/LSTM/GRU cell with backprop-through-time (BPTT), independently derived from
-// the standard recurrence equations (not ported from Darknet's rnn_layer.c/lstm_layer.c/
-// gru_layer.c - this project targets CNN detector/classifier graphs; Darknet itself only
-// exercises these via its separate rnn.c char-sequence tool, so there is no existing cfg/graph
-// concept of a time dimension to integrate into here). Not wired into Network/Trainer's
-// single-pass-per-sample cfg graph - that integration (a cfg layer kind, multi-timestep input
-// framing) is a separate, larger follow-on item; this is the cell math plus CPU training,
-// gradient-checked for correctness, per the user's explicit scope decision to skip an
-// end-to-end toy-sequence demo for now.
+// RNN/LSTM/GRU cell for the cfg graph's one-call-per-timestep sequence framing.
+// The recurrence and BPTT are independently derived from the standard equations.
 
 namespace detector {
 
@@ -29,6 +22,13 @@ public:
     // Clears hidden/cell state and the per-sequence timestep cache - call before feeding a new,
     // independent sequence (state does not carry across sequences, only within one).
     void reset_sequence();
+
+    /** Returns the state carried into the next timestep. */
+    const std::vector<float>& hidden_state() const { return h_; }
+    /** Returns LSTM cell state (zero for the other kinds). */
+    const std::vector<float>& cell_state() const { return c_; }
+    /** Imports a CUDA-computed state and discards any stale CPU timestep cache. */
+    void set_state(const std::vector<float>& hidden, const std::vector<float>& cell);
 
     // Feeds one timestep's input and returns the new hidden state (hidden_size), advancing and
     // caching state for a later backward_through_time() call. `input` must have input_size()

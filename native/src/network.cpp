@@ -442,8 +442,8 @@ Network Network::from_cfg(const std::string& path) {
             // timestep, with hidden state persisting in the Network across calls (see
             // RecurrentCell/Network::reset_sequence()) rather than a batched time dimension -
             // this project's single-pass-per-sample graph has no separate time axis to thread
-            // through every other layer kind, so a cfg mixing spatial (conv/route/...) layers
-            // with a recurrent layer is unsupported (not rejected here, but untested/undefined).
+            // through every other layer kind. Sequential convolution/maxpool/connected layers
+            // can surround one recurrent layer in a classifier sequence.
             layer.kind = section.name == "rnn" ? Kind::rnn : section.name == "lstm" ? Kind::lstm : Kind::gru;
             layer.filters = integer(section, "output");
             positive(layer.filters, "rnn/lstm/gru output");
@@ -633,4 +633,3 @@ std::vector<Detection> decode(const Network& net, const std::vector<Head>& heads
 }
 
 }  // namespace detector
-

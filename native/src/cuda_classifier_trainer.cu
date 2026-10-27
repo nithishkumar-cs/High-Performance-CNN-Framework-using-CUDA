@@ -1,4 +1,5 @@
 #include "detector/cuda_classifier_trainer.hpp"
+#include "detector/cuda_recurrent.hpp"
 #ifdef DETECTOR_HAS_CUDA
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -204,7 +205,62 @@ __global__ void convolution_sgd_bias(float* bias, const float* gradient,
     bias[oc] -= learning_rate * sum;
 }
 
-void launch_check() { check(cudaGetLastError(), "CUDA classifier kernel launch"); }
+/** Applies one averaged dense update after every timestep has backpropagated. */
+__global__ void dense_sequence_sgd(float* weights, float* bias, const float* gradient,
+                                   const float* previous, int inputs, int outputs, int steps,
+                                   float learning_rate, float weight_decay) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= inputs * outputs) return;
+    int oc = pos / inputs, ic = pos % inputs;
+    float sum = 0.0f, bias_sum = 0.0f;
+    for (int t = 0; t < steps; ++t) {
+        float g = gradient[static_cast<std::size_t>(t) * outputs + oc];
+        sum += g * previous[static_cast<std::size_t>(t) * inputs + ic];
+        bias_sum += g;
+    }
+    float old = weights[pos];
+    weights[pos] = old - learning_rate * (sum / steps + weight_decay * old);
+    if (ic == 0) bias[oc] -= learning_rate * bias_sum / steps;
+}
+
+/** Applies one averaged convolution weight update across sequence timesteps. */
+__global__ void convolution_sequence_sgd_weights(float* weights, const float* gradient,
+        const float* previous, int channels, int ih, int iw, int filters, int oh, int ow,
+        int kernel, int stride, int pad, int steps, float learning_rate, float weight_decay) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= filters * channels * kernel * kernel) return;
+    int kx = pos % kernel, ky = pos / kernel % kernel;
+    int ic = pos / (kernel * kernel) % channels;
+    int oc = pos / (kernel * kernel * channels);
+    float sum = 0.0f;
+    for (int t = 0; t < steps; ++t)
+        for (int oy = 0; oy < oh; ++oy)
+            for (int ox = 0; ox < ow; ++ox) {
+                int iy = oy * stride + ky - pad, ix = ox * stride + kx - pad;
+                if (iy < 0 || ix < 0 || iy >= ih || ix >= iw) continue;
+                sum += gradient[(static_cast<std::size_t>(t) * filters + oc) * oh * ow + oy * ow + ox] *
+                       previous[(static_cast<std::size_t>(t) * channels + ic) * ih * iw + iy * iw + ix];
+            }
+    float old = weights[pos];
+    weights[pos] = old - learning_rate * (sum / steps + weight_decay * old);
+}
+
+/** Applies one averaged convolution bias update across sequence timesteps. */
+__global__ void convolution_sequence_sgd_bias(float* bias, const float* gradient,
+        int filters, int oh, int ow, int steps, float learning_rate) {
+    int oc = blockIdx.x * blockDim.x + threadIdx.x;
+    if (oc >= filters) return;
+    float sum = 0.0f;
+    for (int t = 0; t < steps; ++t)
+        for (int pos = 0; pos < oh * ow; ++pos)
+            sum += gradient[(static_cast<std::size_t>(t) * filters + oc) * oh * ow + pos];
+    bias[oc] -= learning_rate * sum / steps;
+}
+
+/** Reports a failed CUDA classifier kernel launch at its graph stage. */
+void launch_check(const char* operation = "CUDA classifier kernel launch") {
+    check(cudaGetLastError(), operation);
+}
 
 }  // namespace
 
@@ -220,7 +276,9 @@ struct CudaClassificationTrainer::Impl {
     std::vector<float*> weights;
     std::vector<float*> biases;
     std::vector<int*> max_index;
+    int recurrent_index = -1;
 
+    /** Allocates graph buffers and uploads learnable nonrecurrent parameters. */
     Impl(Network& net, float lr, float decay)
         : network(net), learning_rate(lr), weight_decay(decay) {
         if (!std::isfinite(lr) || lr <= 0 || !std::isfinite(decay) || decay < 0)
@@ -228,10 +286,17 @@ struct CudaClassificationTrainer::Impl {
         const auto& layers = net.layers_;
         if (layers.size() < 2 || layers.back().kind != Kind::softmax)
             throw std::runtime_error("CUDA classifier requires dense layers and final [softmax]");
-        for (std::size_t i = 0; i + 1 < layers.size(); ++i)
+        for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
+            if (layers[i].kind == Kind::rnn || layers[i].kind == Kind::lstm || layers[i].kind == Kind::gru) {
+                if (recurrent_index >= 0) throw std::runtime_error("CUDA classifier supports at most one recurrent layer");
+                recurrent_index = static_cast<int>(i);
+                if (!net.cells_[i]) throw std::runtime_error("initialize or load recurrent weights before CUDA training");
+                continue;
+            }
             if (layers[i].kind != Kind::connected && layers[i].kind != Kind::convolutional &&
                 layers[i].kind != Kind::maxpool)
-                throw std::runtime_error("CUDA classifier trainer supports connected, convolutional, maxpool, softmax only");
+                throw std::runtime_error("CUDA classifier trainer supports connected, convolutional, maxpool, one recurrent layer, and softmax");
+        }
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
         if (devices < 1) throw std::runtime_error("no CUDA device available");
@@ -251,6 +316,7 @@ struct CudaClassificationTrainer::Impl {
                 max_index[i] = memory.allocate_int(layer.output.elements());
                 continue;
             }
+            if (static_cast<int>(i) == recurrent_index) continue;
             const std::size_t inputs = layer.input.elements();
             std::size_t fan_in = layer.kind == Kind::connected ? inputs :
                 static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
@@ -265,8 +331,11 @@ struct CudaClassificationTrainer::Impl {
         }
     }
 
+    /** Runs one SGD step for a graph with no recurrent layer. */
     ClassificationResult step(const std::vector<float>& host_input, int class_id) {
         const auto& layers = network.layers_;
+        if (recurrent_index >= 0)
+            throw std::runtime_error("cfg has a recurrent layer; use train_sequence() instead of step()");
         if (host_input.size() != network.input_.elements())
             throw std::runtime_error("CUDA classifier input shape mismatch");
         int classes = layers.back().output.c;
@@ -365,11 +434,184 @@ struct CudaClassificationTrainer::Impl {
         return {loss, correct};
     }
 
+    /** Trains one time chunk; nonrecurrent layers remain on CUDA and the CUDA recurrent
+     *  runner performs the entire chunk's recurrence and BPTT before one SGD update. */
+    std::vector<ClassificationResult> train_sequence(
+            const std::vector<std::vector<float>>& host_inputs, const std::vector<int>& class_ids) {
+        const auto& layers = network.layers_;
+        if (recurrent_index < 0)
+            throw std::runtime_error("train_sequence requires one recurrent layer; use step() otherwise");
+        if (host_inputs.empty() || host_inputs.size() != class_ids.size())
+            throw std::runtime_error("train_sequence requires matching, non-empty inputs/class_ids");
+        const int steps = static_cast<int>(host_inputs.size());
+        const int classes = layers.back().output.c;
+        for (std::size_t t = 0; t < host_inputs.size(); ++t) {
+            if (host_inputs[t].size() != network.input_.elements())
+                throw std::runtime_error("CUDA classification input shape mismatch");
+            if (class_ids[t] < 0 || class_ids[t] >= classes)
+                throw std::runtime_error("CUDA classification target outside class range");
+        }
+        DeviceMemory sequence_memory;
+        const std::size_t input_size = network.input_.elements();
+        float* sequence_input = sequence_memory.allocate(static_cast<std::size_t>(steps) * input_size);
+        for (int t = 0; t < steps; ++t)
+            check(cudaMemcpy(sequence_input + static_cast<std::size_t>(t) * input_size,
+                             host_inputs[t].data(), input_size * sizeof(float), cudaMemcpyHostToDevice),
+                  "cudaMemcpy classifier sequence input");
+        std::vector<float*> values(layers.size()), derivatives(layers.size(), nullptr);
+        std::vector<float*> pre(layers.size(), nullptr);
+        std::vector<int*> indices(layers.size(), nullptr);
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            std::size_t count = static_cast<std::size_t>(steps) * layers[i].output.elements();
+            values[i] = sequence_memory.allocate(count);
+            if (layers[i].kind == Kind::softmax) continue;
+            derivatives[i] = sequence_memory.allocate(count);
+            check(cudaMemset(derivatives[i], 0, count * sizeof(float)), "cudaMemset sequence gradient");
+            if (layers[i].kind == Kind::connected || layers[i].kind == Kind::convolutional)
+                pre[i] = sequence_memory.allocate(count);
+            if (layers[i].kind == Kind::maxpool)
+                indices[i] = sequence_memory.allocate_int(count);
+        }
+        constexpr int threads = 256;
+        std::vector<std::vector<float>> recurrent_inputs;
+        std::vector<float> initial_hidden, initial_cell;
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            const auto& layer = layers[i];
+            const float* previous = i ? values[i - 1] : sequence_input;
+            const int in_count = static_cast<int>(layer.input.elements());
+            const int out_count = static_cast<int>(layer.output.elements());
+            if (static_cast<int>(i) == recurrent_index) {
+                auto& cell = *network.cells_[i];
+                initial_hidden = cell.hidden_state(); initial_cell = cell.cell_state();
+                recurrent_inputs.resize(steps, std::vector<float>(static_cast<std::size_t>(in_count)));
+                for (int t = 0; t < steps; ++t)
+                    check(cudaMemcpy(recurrent_inputs[t].data(), previous + static_cast<std::size_t>(t) * in_count,
+                                     in_count * sizeof(float), cudaMemcpyDeviceToHost),
+                          "cudaMemcpy recurrent sequence input");
+                auto recurrence = recurrent_forward_cuda(cell, recurrent_inputs, initial_hidden, initial_cell);
+                for (int t = 0; t < steps; ++t)
+                    check(cudaMemcpy(values[i] + static_cast<std::size_t>(t) * out_count,
+                                     recurrence.outputs[t].data(), out_count * sizeof(float), cudaMemcpyHostToDevice),
+                          "cudaMemcpy recurrent sequence output");
+                cell.set_state(recurrence.final_hidden, recurrence.final_cell);
+                continue;
+            }
+            for (int t = 0; t < steps; ++t) {
+                const float* source = previous + static_cast<std::size_t>(t) * in_count;
+                float* destination = values[i] + static_cast<std::size_t>(t) * out_count;
+                if (layer.kind == Kind::connected)
+                    dense_forward<<<(out_count + threads - 1) / threads, threads>>>(source, weights[i], biases[i],
+                        pre[i] + static_cast<std::size_t>(t) * out_count, destination,
+                        in_count, out_count, layer.leaky);
+                else if (layer.kind == Kind::convolutional)
+                    convolution_forward<<<(out_count + threads - 1) / threads, threads>>>(source, weights[i], biases[i],
+                        pre[i] + static_cast<std::size_t>(t) * out_count, destination,
+                        layer.input.c, layer.input.h, layer.input.w, layer.output.c, layer.output.h,
+                        layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
+                else if (layer.kind == Kind::maxpool)
+                    maxpool_forward<<<(out_count + threads - 1) / threads, threads>>>(source, destination,
+                        indices[i] + static_cast<std::size_t>(t) * out_count,
+                        layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
+                        layer.size, layer.stride);
+                else
+                    softmax_vector<<<1, 1>>>(source, destination, out_count);
+                launch_check("CUDA classifier sequence forward");
+            }
+        }
+        std::vector<ClassificationResult> results(steps);
+        std::vector<float> probabilities(static_cast<std::size_t>(classes));
+        for (int t = 0; t < steps; ++t) {
+            check(cudaMemcpy(probabilities.data(), values.back() + static_cast<std::size_t>(t) * classes,
+                             classes * sizeof(float), cudaMemcpyDeviceToHost),
+                  "cudaMemcpy sequence probabilities");
+            float loss = -std::log(std::max(probabilities[static_cast<std::size_t>(class_ids[t])],
+                                             std::numeric_limits<float>::min()));
+            if (!std::isfinite(loss)) throw std::runtime_error("non-finite CUDA classification loss");
+            bool correct = static_cast<int>(std::max_element(probabilities.begin(), probabilities.end()) -
+                                            probabilities.begin()) == class_ids[t];
+            results[t] = {loss, correct};
+            probabilities[static_cast<std::size_t>(class_ids[t])] -= 1.0f;
+            check(cudaMemcpy(derivatives[layers.size() - 2] + static_cast<std::size_t>(t) * classes,
+                             probabilities.data(), classes * sizeof(float), cudaMemcpyHostToDevice),
+                  "cudaMemcpy sequence loss gradient");
+        }
+        for (std::size_t reverse = layers.size() - 1; reverse-- > 0;) {
+            const auto& layer = layers[reverse];
+            const int in_count = static_cast<int>(layer.input.elements());
+            const int out_count = static_cast<int>(layer.output.elements());
+            const float* previous = reverse ? values[reverse - 1] : sequence_input;
+            if (static_cast<int>(reverse) == recurrent_index) {
+                std::vector<std::vector<float>> direct(steps, std::vector<float>(out_count));
+                for (int t = 0; t < steps; ++t)
+                    check(cudaMemcpy(direct[t].data(), derivatives[reverse] + static_cast<std::size_t>(t) * out_count,
+                                     out_count * sizeof(float), cudaMemcpyDeviceToHost),
+                          "cudaMemcpy recurrent sequence gradient");
+                auto& cell = *network.cells_[reverse];
+                auto recurrence = recurrent_forward_backward_cuda(
+                    cell, recurrent_inputs, direct, initial_hidden, initial_cell);
+                if (reverse)
+                    for (int t = 0; t < steps; ++t)
+                        check(cudaMemcpy(derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count,
+                                         recurrence.input_gradients[t].data(), in_count * sizeof(float),
+                                         cudaMemcpyHostToDevice), "cudaMemcpy recurrent input gradient");
+                auto parameters = cell.parameters();
+                for (std::size_t p = 0; p < parameters.size(); ++p)
+                    *parameters[p] -= learning_rate * recurrence.parameter_gradients[p];
+                continue;
+            }
+            for (int t = 0; t < steps; ++t) {
+                float* grad = derivatives[reverse] + static_cast<std::size_t>(t) * out_count;
+                if (layer.kind == Kind::maxpool) {
+                    if (reverse)
+                        maxpool_backward<<<(out_count + threads - 1) / threads, threads>>>(
+                            grad, indices[reverse] + static_cast<std::size_t>(t) * out_count,
+                            derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count, out_count);
+                    launch_check("CUDA classifier sequence maxpool backward");
+                    continue;
+                }
+                activation_backward<<<(out_count + threads - 1) / threads, threads>>>(
+                    grad, pre[reverse] + static_cast<std::size_t>(t) * out_count, out_count, layer.leaky);
+                launch_check("CUDA classifier sequence activation backward");
+                if (!reverse) continue;
+                float* preceding = derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count;
+                if (layer.kind == Kind::connected)
+                    dense_backward_input<<<(in_count + threads - 1) / threads, threads>>>(
+                        grad, weights[reverse], preceding, in_count, out_count);
+                else
+                    convolution_backward_input<<<(in_count + threads - 1) / threads, threads>>>(
+                        grad, weights[reverse], preceding, layer.input.c, layer.input.h, layer.input.w,
+                        layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
+                launch_check("CUDA classifier sequence input backward");
+            }
+            if (layer.kind == Kind::maxpool) continue;
+            if (layer.kind == Kind::connected)
+                dense_sequence_sgd<<<(in_count * out_count + threads - 1) / threads, threads>>>(
+                    weights[reverse], biases[reverse], derivatives[reverse], previous,
+                    in_count, out_count, steps, learning_rate, weight_decay);
+            else {
+                int weight_count = static_cast<int>(layer.weights.size());
+                convolution_sequence_sgd_weights<<<(weight_count + threads - 1) / threads, threads>>>(
+                    weights[reverse], derivatives[reverse], previous, layer.input.c, layer.input.h,
+                    layer.input.w, layer.output.c, layer.output.h, layer.output.w,
+                    layer.size, layer.stride, layer.padding, steps, learning_rate, weight_decay);
+                launch_check("CUDA classifier sequence convolution weight SGD");
+                convolution_sequence_sgd_bias<<<(layer.output.c + threads - 1) / threads, threads>>>(
+                    biases[reverse], derivatives[reverse], layer.output.c,
+                    layer.output.h, layer.output.w, steps, learning_rate);
+                launch_check("CUDA classifier sequence convolution bias SGD");
+            }
+            if (layer.kind == Kind::connected) launch_check("CUDA classifier sequence dense SGD");
+        }
+        check(cudaDeviceSynchronize(), "cudaDeviceSynchronize classifier sequence SGD");
+        return results;
+    }
+
+    /** Downloads learned nonrecurrent parameters for checkpointing or CPU inference. */
     void sync_to_network() {
         auto& layers = network.layers_;
         for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
             auto& layer = layers[i];
-            if (layer.kind == Kind::maxpool) continue;
+            if (layer.kind == Kind::maxpool || static_cast<int>(i) == recurrent_index) continue;
             check(cudaMemcpy(layer.weights.data(), weights[i],
                              layer.weights.size() * sizeof(float), cudaMemcpyDeviceToHost),
                   "cudaMemcpy learned weights");
@@ -385,6 +627,10 @@ CudaClassificationTrainer::CudaClassificationTrainer(Network& network, float lea
 CudaClassificationTrainer::~CudaClassificationTrainer() = default;
 ClassificationResult CudaClassificationTrainer::step(const std::vector<float>& input, int class_id) {
     return impl_->step(input, class_id);
+}
+std::vector<ClassificationResult> CudaClassificationTrainer::train_sequence(
+        const std::vector<std::vector<float>>& inputs, const std::vector<int>& class_ids) {
+    return impl_->train_sequence(inputs, class_ids);
 }
 void CudaClassificationTrainer::sync_to_network() { impl_->sync_to_network(); }
 

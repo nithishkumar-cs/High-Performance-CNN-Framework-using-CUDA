@@ -1,4 +1,5 @@
 #include "detector/cuda_session.hpp"
+#include "detector/cuda_recurrent.hpp"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
 #endif
@@ -257,12 +258,15 @@ struct CudaSession::Impl {
                       "cudaMemcpy softmax output");
                 heads.push_back(std::move(head));
             } else if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
-                // Not yet ported to CUDA inference (only the CPU Network/ClassificationTrainer
-                // path and the standalone cuda_recurrent.cu sequence runner support rnn/lstm/gru
-                // so far) - fail loudly instead of silently mis-copying through the YOLO-head
-                // fallback below (whose byte count assumes output.elements() == input.elements(),
-                // false for a recurrent layer's hidden size).
-                throw std::runtime_error("rnn/lstm/gru layers are not supported by the CUDA inference backend yet; use Backend::cpu");
+                auto* cell = network.cell_at(index);
+                if (!cell) throw std::runtime_error("initialize or load recurrent weights before CUDA inference");
+                std::vector<float> timestep(layer.input.elements());
+                check(cudaMemcpy(timestep.data(), previous, timestep.size() * sizeof(float), cudaMemcpyDeviceToHost),
+                      "cudaMemcpy recurrent input");
+                auto state = recurrent_forward_cuda(*cell, {timestep}, cell->hidden_state(), cell->cell_state());
+                cell->set_state(state.final_hidden, state.final_cell);
+                check(cudaMemcpy(result, state.outputs.front().data(), elements * sizeof(float), cudaMemcpyHostToDevice),
+                      "cudaMemcpy recurrent output");
             } else {
                 check(cudaMemcpy(result, previous, layer.output.elements() * sizeof(float), cudaMemcpyDeviceToDevice),
                       "cudaMemcpy YOLO head");

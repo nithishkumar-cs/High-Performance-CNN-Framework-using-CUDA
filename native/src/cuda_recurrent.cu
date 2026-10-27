@@ -197,16 +197,21 @@ __global__ void backward_inputs(const float* params, const float* deltas, const 
 
 }  // namespace
 
-CudaRecurrentResult recurrent_forward_backward_cuda(
+/** Runs a CUDA recurrent sequence, optionally applying BPTT to injected hidden gradients. */
+CudaRecurrentResult run_recurrent_cuda(
     const RecurrentCell& cell, const std::vector<std::vector<float>>& inputs,
-    const std::vector<std::vector<float>>& hidden_gradients) {
+    const std::vector<std::vector<float>>* hidden_gradients,
+    const std::vector<float>& initial_hidden, const std::vector<float>& initial_cell) {
     int timesteps = static_cast<int>(inputs.size());
     int input_size = cell.input_size(), hidden_size = cell.hidden_size();
-    if (timesteps < 1 || hidden_gradients.size() != inputs.size() || input_size < 1 || hidden_size < 1)
+    if (timesteps < 1 || (hidden_gradients && hidden_gradients->size() != inputs.size()) ||
+        input_size < 1 || hidden_size < 1 ||
+        (!initial_hidden.empty() && initial_hidden.size() != static_cast<std::size_t>(hidden_size)) ||
+        (!initial_cell.empty() && initial_cell.size() != static_cast<std::size_t>(hidden_size)))
         throw std::runtime_error("invalid CUDA recurrent sequence shape");
     for (int t = 0; t < timesteps; ++t)
         if (inputs[t].size() != static_cast<std::size_t>(input_size) ||
-            hidden_gradients[t].size() != static_cast<std::size_t>(hidden_size))
+            (hidden_gradients && (*hidden_gradients)[t].size() != static_cast<std::size_t>(hidden_size)))
             throw std::runtime_error("CUDA recurrent timestep size mismatch");
     int kind = static_cast<int>(cell.kind());
     int gate_count = kind == 0 ? 1 : kind == 1 ? 4 : 3;
@@ -216,19 +221,29 @@ CudaRecurrentResult recurrent_forward_backward_cuda(
     flat_direct.reserve(static_cast<std::size_t>(timesteps) * hidden_size);
     for (int t = 0; t < timesteps; ++t) {
         flat_inputs.insert(flat_inputs.end(), inputs[t].begin(), inputs[t].end());
-        flat_direct.insert(flat_direct.end(), hidden_gradients[t].begin(), hidden_gradients[t].end());
+        if (hidden_gradients)
+            flat_direct.insert(flat_direct.end(), (*hidden_gradients)[t].begin(), (*hidden_gradients)[t].end());
     }
     auto values = cell.parameter_values();
-    DeviceFloats params(values.size()), x(flat_inputs.size()), direct(flat_direct.size());
+    DeviceFloats params(values.size()), x(flat_inputs.size()), direct(std::max<std::size_t>(1, flat_direct.size()));
     DeviceFloats h(static_cast<std::size_t>(timesteps + 1) * hidden_size);
     DeviceFloats c(static_cast<std::size_t>(timesteps + 1) * hidden_size);
     DeviceFloats gates(static_cast<std::size_t>(timesteps) * gate_count * hidden_size);
-    DeviceFloats dx(flat_inputs.size()), dparams(values.size());
+    DeviceFloats dx(std::max<std::size_t>(1, hidden_gradients ? flat_inputs.size() : 1));
+    DeviceFloats dparams(std::max<std::size_t>(1, hidden_gradients ? values.size() : 1));
     DeviceFloats delta(static_cast<std::size_t>(gate_count) * hidden_size);
     DeviceFloats hcarry(hidden_size), hnext(hidden_size), ccarry(hidden_size), cnext(hidden_size);
     DeviceFloats reset_gradient(hidden_size);
-    params.upload(values.data()); x.upload(flat_inputs.data()); direct.upload(flat_direct.data());
-    h.clear(); c.clear(); dparams.clear(); hcarry.clear(); ccarry.clear();
+    params.upload(values.data()); x.upload(flat_inputs.data());
+    if (hidden_gradients) direct.upload(flat_direct.data());
+    h.clear(); c.clear();
+    if (!initial_hidden.empty())
+        check(cudaMemcpy(h.get(), initial_hidden.data(), hidden_size * sizeof(float), cudaMemcpyHostToDevice),
+              "cudaMemcpy recurrent initial hidden");
+    if (!initial_cell.empty())
+        check(cudaMemcpy(c.get(), initial_cell.data(), hidden_size * sizeof(float), cudaMemcpyHostToDevice),
+              "cudaMemcpy recurrent initial cell");
+    if (hidden_gradients) { dparams.clear(); hcarry.clear(); ccarry.clear(); }
     int gate_blocks = (gate_count * hidden_size + kThreads - 1) / kThreads;
     int hidden_blocks = (hidden_size + kThreads - 1) / kThreads;
     for (int t = 0; t < timesteps; ++t) {
@@ -247,9 +262,10 @@ CudaRecurrentResult recurrent_forward_backward_cuda(
         }
         check(cudaGetLastError(), "CUDA recurrent forward state");
     }
-    int parameter_blocks = (gate_count * stride + kThreads - 1) / kThreads;
-    int input_blocks = (std::max(input_size, hidden_size) + kThreads - 1) / kThreads;
-    for (int t = timesteps - 1; t >= 0; --t) {
+    if (hidden_gradients) {
+      int parameter_blocks = (gate_count * stride + kThreads - 1) / kThreads;
+      int input_blocks = (std::max(input_size, hidden_size) + kThreads - 1) / kThreads;
+      for (int t = timesteps - 1; t >= 0; --t) {
         const float* prev_h = h.get() + static_cast<std::size_t>(t) * hidden_size;
         const float* g = gates.get() + static_cast<std::size_t>(t) * gate_count * hidden_size;
         const float* dh = direct.get() + static_cast<std::size_t>(t) * hidden_size;
@@ -272,19 +288,41 @@ CudaRecurrentResult recurrent_forward_backward_cuda(
         check(cudaGetLastError(), "CUDA recurrent input gradient");
         hcarry.swap(hnext);
         if (kind == 1) ccarry.swap(cnext);
+      }
     }
     std::vector<float> flat_h(static_cast<std::size_t>(timesteps + 1) * hidden_size);
-    std::vector<float> flat_dx(flat_inputs.size()), flat_dparams(values.size());
-    h.download(flat_h.data()); dx.download(flat_dx.data()); dparams.download(flat_dparams.data());
+    std::vector<float> flat_c(static_cast<std::size_t>(timesteps + 1) * hidden_size);
+    std::vector<float> flat_dx, flat_dparams;
+    h.download(flat_h.data()); c.download(flat_c.data());
+    if (hidden_gradients) {
+        flat_dx.resize(flat_inputs.size()); flat_dparams.resize(values.size());
+        dx.download(flat_dx.data()); dparams.download(flat_dparams.data());
+    }
     CudaRecurrentResult result;
     result.parameter_gradients = std::move(flat_dparams);
+    result.final_hidden.assign(flat_h.end() - hidden_size, flat_h.end());
+    result.final_cell.assign(flat_c.end() - hidden_size, flat_c.end());
     for (int t = 0; t < timesteps; ++t) {
         result.outputs.emplace_back(flat_h.begin() + static_cast<std::size_t>(t + 1) * hidden_size,
                                     flat_h.begin() + static_cast<std::size_t>(t + 2) * hidden_size);
-        result.input_gradients.emplace_back(flat_dx.begin() + static_cast<std::size_t>(t) * input_size,
-                                            flat_dx.begin() + static_cast<std::size_t>(t + 1) * input_size);
+        if (hidden_gradients)
+            result.input_gradients.emplace_back(flat_dx.begin() + static_cast<std::size_t>(t) * input_size,
+                                                 flat_dx.begin() + static_cast<std::size_t>(t + 1) * input_size);
     }
     return result;
+}
+
+CudaRecurrentResult recurrent_forward_backward_cuda(
+    const RecurrentCell& cell, const std::vector<std::vector<float>>& inputs,
+    const std::vector<std::vector<float>>& hidden_gradients,
+    const std::vector<float>& initial_hidden, const std::vector<float>& initial_cell) {
+    return run_recurrent_cuda(cell, inputs, &hidden_gradients, initial_hidden, initial_cell);
+}
+
+CudaRecurrentResult recurrent_forward_cuda(
+    const RecurrentCell& cell, const std::vector<std::vector<float>>& inputs,
+    const std::vector<float>& initial_hidden, const std::vector<float>& initial_cell) {
+    return run_recurrent_cuda(cell, inputs, nullptr, initial_hidden, initial_cell);
 }
 
 }  // namespace detector

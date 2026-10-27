@@ -171,7 +171,17 @@ YOLO inference path.
 **2026-10-26 — RNN/LSTM/GRU forward and backpropagation through time.**
 - Implemented all three recurrent cell kinds independently on CPU and CUDA. CPU finite-difference
   checks cover gate parameters; the CUDA test compares every timestep output, input gradient and
-  parameter gradient with the CPU path. Sequence-to-cfg graph integration remains open.
+  parameter gradient with the CPU path.
+
+**2026-10-27 — RNN/LSTM/GRU cfg integration completed on CPU and CUDA.**
+- All three kinds run as cfg layers with one timestep per `classify` call and explicit sequence
+  reset. CPU and CUDA inference carry hidden and LSTM cell state across calls.
+- CPU and CUDA classifier trainers support truncated BPTT chunks; convolution, maxpool and dense
+  layers around the recurrent layer stay in the CUDA graph and receive one averaged SGD update
+  per chunk. CUDA recurrent parameter updates match the CPU trainer's unaveraged BPTT rule.
+- CPU/CUDA parity covers stateful inference, two consecutive training chunks, every learnable
+  parameter, and a convolution/maxpool prefix. A parity test found and fixed a maxpool path that
+  incorrectly fell through to a weight update after backpropagation.
 
 ## Bugs found and fixed (debugging skills, concrete)
 

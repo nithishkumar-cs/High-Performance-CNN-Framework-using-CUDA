@@ -122,6 +122,71 @@ void exercise_sequence(const fs::path& cfg) {
 }
 
 #ifdef DETECTOR_HAS_CUDA
+/** Checks stateful inference and two truncated BPTT updates against the CPU trainer. */
+void exercise_cuda_sequence_parity(const fs::path& cfg) {
+    auto cpu = detector::Network::from_cfg(cfg.string());
+    auto cuda = detector::Network::from_cfg(cfg.string());
+    cpu.initialize_random(71);
+    cuda.initialize_random(71);
+    const std::vector<std::vector<float>> tokens{{1.0f, 0.0f}, {0.0f, 1.0f},
+                                                  {0.3f, -0.5f}, {-0.2f, 0.6f},
+                                                  {1.0f, 0.0f}};
+    std::vector<std::vector<float>> inputs(tokens.size(),
+        std::vector<float>(cpu.input_shape().elements()));
+    for (std::size_t t = 0; t < inputs.size(); ++t)
+        for (std::size_t p = 0; p < inputs[t].size(); ++p)
+            inputs[t][p] = tokens[t][p % 2] + static_cast<float>(p % 5) * 0.04f;
+    cpu.reset_sequence(); cuda.reset_sequence();
+    for (const auto& input : inputs) {
+        auto a = cpu.classify(input, detector::Backend::cpu);
+        auto b = cuda.classify(input, detector::Backend::cuda);
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (std::abs(a[i] - b[i]) > 2e-4f)
+                throw std::runtime_error("CUDA recurrent inference mismatch: " + cfg.string());
+    }
+    cpu.reset_sequence(); cuda.reset_sequence();
+    detector::ClassificationTrainer cpu_trainer(cpu, 0.01f);
+    detector::CudaClassificationTrainer cuda_trainer(cuda, 0.01f);
+    for (int chunk = 0; chunk < 2; ++chunk) {
+        std::vector<std::vector<float>> samples = chunk ?
+            std::vector<std::vector<float>>(inputs.begin() + 3, inputs.end()) :
+            std::vector<std::vector<float>>(inputs.begin(), inputs.begin() + 3);
+        std::vector<int> targets = chunk ? std::vector<int>{1, 0} : std::vector<int>{0, 0, 1};
+        auto a = cpu_trainer.train_sequence(samples, targets);
+        auto b = cuda_trainer.train_sequence(samples, targets);
+        for (std::size_t t = 0; t < a.size(); ++t)
+            if (std::abs(a[t].loss - b[t].loss) > 2e-4f)
+                throw std::runtime_error("CUDA recurrent training loss mismatch: " + cfg.string());
+        cuda_trainer.sync_to_network();
+        for (std::size_t i = 0; i < cpu.layers().size(); ++i) {
+            if (auto* cell = cpu.cell_at(i)) {
+                auto expected = cell->parameter_values();
+                auto actual = cuda.cell_at(i)->parameter_values();
+                for (std::size_t p = 0; p < expected.size(); ++p)
+                    if (std::abs(expected[p] - actual[p]) > 3e-4f)
+                        throw std::runtime_error("CUDA recurrent parameter mismatch: " + cfg.string());
+            } else {
+                const auto& expected = cpu.layers()[i];
+                const auto& actual = cuda.layers()[i];
+                for (std::size_t p = 0; p < expected.weights.size(); ++p)
+                    if (std::abs(expected.weights[p] - actual.weights[p]) > 3e-4f)
+                        throw std::runtime_error("CUDA sequence dense weight mismatch: " + cfg.string());
+                for (std::size_t p = 0; p < expected.biases.size(); ++p)
+                    if (std::abs(expected.biases[p] - actual.biases[p]) > 3e-4f)
+                        throw std::runtime_error("CUDA sequence dense bias mismatch: " + cfg.string());
+            }
+        }
+    }
+    cpu.reset_sequence(); cuda.reset_sequence();
+    for (const auto& input : inputs) {
+        auto a = cpu.classify(input, detector::Backend::cpu);
+        auto b = cuda.classify(input, detector::Backend::cuda);
+        for (std::size_t i = 0; i < a.size(); ++i)
+            if (std::abs(a[i] - b[i]) > 3e-4f)
+                throw std::runtime_error("CUDA trained recurrent inference mismatch: " + cfg.string());
+    }
+}
+
 void exercise_single_step_parity(const fs::path& cfg) {
     auto cpu = detector::Network::from_cfg(cfg.string());
     auto cuda = detector::Network::from_cfg(cfg.string());
@@ -199,6 +264,10 @@ int main() {
         exercise_single_step_parity(directory / "classifier-linear.cfg");
         exercise_single_step_parity(directory / "classifier-dense.cfg");
         exercise_single_step_parity(directory / "classifier-conv.cfg");
+        exercise_cuda_sequence_parity(directory / "rnn-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "lstm-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "gru-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "rnn-conv-classifier.cfg");
 #endif
         return 0;
     } catch (const std::exception& error) {

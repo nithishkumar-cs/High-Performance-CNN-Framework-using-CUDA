@@ -544,12 +544,16 @@ struct CudaTrainer::Impl {
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
         if (devices < 1) throw std::runtime_error("no CUDA device available");
         const auto& layers = net.layers();
-        for (const auto& layer : layers)
+        for (const auto& layer : layers) {
+            if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru)
+                throw std::runtime_error("CUDA detector Trainer does not support rnn/lstm/gru layers; "
+                                         "use CudaClassificationTrainer::train_sequence");
             if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::route &&
                 layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo &&
                 layer.kind != Kind::dropout && layer.kind != Kind::reorg && layer.kind != Kind::region)
                 throw std::runtime_error("CUDA detector training supports convolutional, maxpool, route, "
-                                          "upsample, shortcut, yolo, region, dropout and reorg layers only");
+                                           "upsample, shortcut, yolo, region, dropout and reorg layers only");
+        }
         // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
         // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
         // statistics (and every other per-sample forward/backward op) can run within one step().

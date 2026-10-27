@@ -82,6 +82,15 @@ void RecurrentCell::reset_sequence() {
     cache_.clear();
 }
 
+void RecurrentCell::set_state(const std::vector<float>& hidden, const std::vector<float>& cell) {
+    if (hidden.size() != static_cast<std::size_t>(hidden_size_) ||
+        cell.size() != static_cast<std::size_t>(hidden_size_))
+        throw std::runtime_error("RecurrentCell::set_state: state size mismatch");
+    h_ = hidden;
+    c_ = cell;
+    cache_.clear();
+}
+
 const std::vector<float>& RecurrentCell::step(const std::vector<float>& input) {
     if (static_cast<int>(input.size()) != input_size_) throw std::runtime_error("RecurrentCell::step: input size mismatch");
     Timestep ts;

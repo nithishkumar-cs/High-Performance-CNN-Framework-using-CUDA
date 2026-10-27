@@ -1,10 +1,11 @@
 """Export this project's supported Darknet detector graphs to standard ONNX.
 
 Inputs are a matching Darknet .cfg and .weights; no PyTorch or upstream Darknet
-source is used. Supports convolutional/maxpool/route/upsample/shortcut bodies
-with one or more [yolo] and/or [region] heads - i.e. YOLOv3-tiny (2 heads),
-full YOLOv3/Darknet-53 (3 heads, using shortcut for its residual blocks), and
-YOLOv2/Darknet19 (1 region head). Outputs are raw NCHW YOLO/region head
+source is used. Supports convolutional/maxpool/route/upsample/shortcut/reorg
+bodies with one or more [yolo] and/or [region] heads - i.e. YOLOv3-tiny (2
+heads), full YOLOv3/Darknet-53 (3 heads, using shortcut for its residual
+blocks), and YOLOv2/Darknet19 (1 region head, using reorg for its passthrough
+layer). Outputs are raw NCHW YOLO/region head
 logits, one per head in layer order. Letterboxing, decode, and NMS
 intentionally remain outside the ONNX graph so the same postprocessor can be
 used for native CUDA and TensorRT accuracy comparisons. The input cfg may be
@@ -156,14 +157,21 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
             sources = [len(tensors) + value if value < 0 else value for value in raw]
             if not sources or any(source < 0 or source >= len(tensors) for source in sources):
                 raise ValueError(f"invalid route at layer {index}")
-            if any(shapes[source][1:] != shape[1:] for source in sources):
+            # Compare every source branch's spatial shape against the FIRST branch's shape, not
+            # against `shape` (the immediately-preceding layer's output) - a route layer's output
+            # never depends on what came immediately before it, only on its listed sources. Using
+            # `shape` here silently worked only when a route's sources happened to match the
+            # preceding layer (e.g. YOLOv3-tiny/mini.cfg's patterns) and incorrectly rejected a
+            # standalone passthrough route (YOLOv2's `[route] layers=-9`) - the same bug found and
+            # fixed in network.cpp's layer_output_shape (req-31/req-37, 2026-10-13).
+            if any(shapes[source][1:] != shapes[sources[0]][1:] for source in sources):
                 raise ValueError(f"route spatial shapes differ at layer {index}")
             if len(sources) == 1:
                 nodes.append(helper.make_node("Identity", [tensors[sources[0]]], [name], name=name))
             else:
                 nodes.append(helper.make_node("Concat", [tensors[source] for source in sources],
                                               [name], name=name, axis=1))
-            shape = (sum(shapes[source][0] for source in sources), h, w)
+            shape = (sum(shapes[source][0] for source in sources), shapes[sources[0]][1], shapes[sources[0]][2])
             previous = name
         elif kind == "upsample":
             stride = int(options["stride"])
@@ -177,6 +185,30 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
                                           coordinate_transformation_mode="asymmetric",
                                           nearest_mode="floor"))
             shape = (c, h * stride, w * stride)
+            previous = name
+        elif kind == "reorg":
+            # Space-to-depth (YOLOv2's passthrough layer), this project's own independently-derived
+            # channel/spatial convention (see network.cpp's reorg_forward): output channel
+            # ic*stride^2 + (iy%stride)*stride + (ix%stride) at spatial (iy//stride, ix//stride).
+            # Reshape [1,C,H,W] -> [1,C,OH,S,OW,S] (splitting H/W into outer,inner by stride),
+            # transpose the two inner (stride) axes before the two outer (OH,OW) axes, then
+            # reshape to [1, C*S*S, OH, OW] - a bijection, so any consistent mapping is correct for
+            # training, but this one is NOT guaranteed to match original Darknet's own interleaving.
+            stride = int(options["stride"])
+            if stride <= 0 or h % stride or w % stride:
+                raise ValueError(f"invalid reorg at layer {index}")
+            out_h, out_w = h // stride, w // stride
+            split_name, merge_name = f"{name}_split_shape", f"{name}_merge_shape"
+            initializers.append(numpy_helper.from_array(
+                np.array([1, c, out_h, stride, out_w, stride], dtype=np.int64), split_name))
+            initializers.append(numpy_helper.from_array(
+                np.array([1, c * stride * stride, out_h, out_w], dtype=np.int64), merge_name))
+            split_tensor, transposed = f"{name}_split", f"{name}_transposed"
+            nodes.append(helper.make_node("Reshape", [previous, split_name], [split_tensor], name=f"{name}_reshape_split"))
+            nodes.append(helper.make_node("Transpose", [split_tensor], [transposed],
+                                          name=f"{name}_transpose", perm=[0, 1, 3, 5, 2, 4]))
+            nodes.append(helper.make_node("Reshape", [transposed, merge_name], [name], name=f"{name}_reshape_merge"))
+            shape = (c * stride * stride, out_h, out_w)
             previous = name
         elif kind == "shortcut":
             from_raw = int(options["from"])

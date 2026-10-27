@@ -24,11 +24,11 @@ ctest --test-dir build --output-on-failure
 
 For CPU-only builds, use `-DDETECTOR_CUDA=OFF` and omit `CMAKE_CUDA_ARCHITECTURES`. Add `-DDETECTOR_CUDNN=ON` to an existing CUDA build to use the optional cuDNN kernels after staging the SDK with `native/tools/setup_cudnn.ps1`. Without OpenCV, input images must be PPM. Select the CUDA architecture for your GPU.
 
-Train future models on the laptop GPU. The historical [full-dataset MNIST Jetson runs](docs/mnist-jetson.md) reached **97.24% test accuracy** for a two-layer dense model and **97.27%** for a small CNN. Use a fresh output checkpoint name because the CLI refuses to overwrite existing weights:
+Train future models on the laptop GPU. The [deeper CNN example](native/examples/mnist-deep-conv.cfg), trained here for three epochs on all 60,000 MNIST images, reached **98.49% test accuracy** with matching CPU/CUDA evaluation. Historical [full-dataset MNIST Jetson runs](docs/mnist-jetson.md) reached **97.24%** for a two-layer dense model and **97.27%** for a small CNN. Use a fresh output checkpoint name because the CLI refuses to overwrite existing weights:
 
 ```sh
-./build/cuda_classifier train native/examples/mnist-mlp.cfg data/mnist/train-images-idx3-ubyte data/mnist/train-labels-idx1-ubyte runs/mnist/retrain-mlp.weights --backend cuda --epochs 3 --lr 0.01
-./build/cuda_classifier eval native/examples/mnist-mlp.cfg data/mnist/t10k-images-idx3-ubyte data/mnist/t10k-labels-idx1-ubyte runs/mnist/mnist-mlp-full.weights --backend cuda
+./build/cuda_classifier train native/examples/mnist-deep-conv.cfg data/mnist/train-images-idx3-ubyte data/mnist/train-labels-idx1-ubyte runs/mnist/new-deep-conv.weights --backend cuda --epochs 3 --lr 0.01
+./build/cuda_classifier eval native/examples/mnist-deep-conv.cfg data/mnist/t10k-images-idx3-ubyte data/mnist/t10k-labels-idx1-ubyte runs/mnist/new-deep-conv.weights --backend cuda
 ```
 
 ```sh

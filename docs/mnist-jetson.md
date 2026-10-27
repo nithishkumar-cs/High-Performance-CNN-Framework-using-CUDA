@@ -1,5 +1,9 @@
 # Configurable classifier training and Jetson inference
 
+**Historical Jetson run:** future training uses the laptop GPU. A later, deeper two-convolution
+classifier trained on the laptop reached 98.49% held-out MNIST accuracy; see
+[current framework status](framework-status.md). The measurements below remain for comparison.
+
 This is a second model family in the project's cfg-driven C++/CUDA graph, alongside the YOLOv3-tiny detection workload. The examples are [linear](../native/examples/mnist-linear.cfg), [two-layer dense](../native/examples/mnist-mlp.cfg), and [convolutional](../native/examples/mnist-conv.cfg) classifiers. All three train with batch-one SGD and run inference on CPU or native CUDA. This is a limited framework milestone, not full Darknet training support.
 
 ## Data and reproducibility

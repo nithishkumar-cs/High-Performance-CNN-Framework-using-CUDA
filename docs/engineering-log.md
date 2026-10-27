@@ -194,6 +194,19 @@ YOLO inference path.
   rejection. This laptop has only one GPU; actual two-device throughput and behavior remain to be
   measured on a multi-GPU host. Synchronization currently gathers tensors through host memory.
 
+**2026-10-27 — Deeper CNN classifier trained end to end on the laptop GPU.**
+- Added a 28×28 MNIST cfg with two convolution/maxpool stages and a 64-unit hidden dense layer.
+  The native CUDA classifier trainer completed three fixed epochs over all 60,000 training images
+  (seed 2026, LR 0.01, sample-wise SGD). Mean loss fell 0.131075 → 0.053979 → 0.038460.
+- Its ignored checkpoint scored 9,849/10,000 = **98.49%** on the held-out test split with both
+  native CUDA and CPU inference. This is above the earlier four-filter, one-conv classifier's
+  97.27% test result. Laptop evaluation mean times were 0.131536 ms/sample CUDA and
+  0.604649 ms/sample CPU for IDX sample conversion plus forward, excluding file I/O and setup;
+  these are not Jetson timings.
+- Checkpoint: `runs/mnist/deep-cnn-full-20261027.weights`, SHA-256
+  `aeca7f625a307cb9012e4821814c71c818cfa74c0a1f7234d204be8bd049920`. Training and
+  evaluation output is under `.agent-work/logs/deep_cnn_*`.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

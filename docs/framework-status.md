@@ -23,6 +23,8 @@ All detector scores below use the same native CUDA evaluator with confidence 0.0
 
 The corrected native YOLOv3-tiny checkpoint was also evaluated on Jetson with native CUDA and TensorRT FP32/FP16. Historical full-dataset MNIST Jetson runs of the project's classifier trainer scored 97.24% test accuracy for an MLP and 97.27% for a small CNN.
 
+A deeper two-convolution MNIST classifier trained by this framework on the laptop RTX 3070 Ti for three epochs (60,000 training images per epoch, seed 2026, LR 0.01) scored **98.49%** on all 10,000 held-out test images. CPU and CUDA inference agreed on the correct count (9,849). Its checkpoint and logs remain local ignored artifacts.
+
 ## Current limits
 
 - This is the supported subset of Darknet's cfg vocabulary, not an arbitrary upstream cfg interpreter. A same-evaluator external-Darknet YOLOv2 baseline has not been run.

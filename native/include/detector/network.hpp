@@ -2,9 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "detector/recurrent.hpp"
 
 namespace detector {
 
@@ -15,14 +18,15 @@ struct Shape {
     std::size_t elements() const;
 };
 
-enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region };
+enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region, rnn, lstm, gru };
 enum class Backend { cpu, cuda, tensorrt };
 
 struct Layer {
     Kind kind{};
     Shape input;
     Shape output;
-    int filters = 0;
+    int filters = 0;  // also hidden/output size for rnn/lstm/gru layers (cfg `output=`), reusing
+                       // the same field connected layers already use for their output unit count.
     int size = 0;
     int stride = 1;
     int padding = 0;
@@ -93,15 +97,34 @@ public:
     // Mutable single-layer access for tests that perturb a trained parameter directly
     // (e.g. a finite-difference gradient check against Trainer's analytic backward).
     Layer& layer(std::size_t index) { return layers_.at(index); }
+    // Mutable access to an rnn/lstm/gru layer's live cell (null for every other layer kind) -
+    // callable through a const Network since cells_ is mutable (see its declaration below);
+    // used by cpu_forward() to advance hidden state one timestep per call.
+    RecurrentCell* cell_at(std::size_t index) const {
+        return cells_.at(index) ? &*cells_[index] : nullptr;
+    }
     std::vector<Head> forward(const std::vector<float>& input, Backend backend) const;
     std::vector<float> classify(const std::vector<float>& input, Backend backend) const;
     std::vector<Detection> detect(const std::vector<float>& input, Backend backend,
                                   float threshold = 0.25f, float iou_threshold = 0.45f) const;
+    // Clears every rnn/lstm/gru layer's hidden (and, for lstm, cell) state - call between
+    // independent sequences. Each forward()/classify() call is one timestep; state otherwise
+    // persists across calls, matching Darknet's own rnn.c streaming usage (and this project's
+    // BN running-stat persistence pattern) rather than resetting on every call. A no-op cfg with
+    // no recurrent layers.
+    void reset_sequence();
 
 private:
     friend class Trainer;
     friend class ClassificationTrainer;
     friend class CudaClassificationTrainer;
+    // Lazily built in from_cfg() for every rnn/lstm/gru layer (input/hidden size are fixed then);
+    // initialize_random()/load_weights() only overwrite its learned parameters, never resize it.
+    // mutable so const forward()/classify() can still advance each cell's persistent hidden
+    // state one timestep per call - that state is runtime position in a sequence, not part of
+    // the network's logical (weight) value, the same justification batch-norm running stats
+    // would use if they were mutated outside Trainer's non-const step().
+    mutable std::vector<std::optional<RecurrentCell>> cells_;
     Shape input_;
     std::vector<Layer> layers_;
 };

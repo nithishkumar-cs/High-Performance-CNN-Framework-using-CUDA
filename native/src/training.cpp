@@ -22,7 +22,15 @@ void write_floats(std::ofstream& file, const std::vector<float>& values) {
 
 void Network::initialize_random(std::uint32_t seed) {
     std::mt19937 rng(seed);
-    for (auto& layer : layers_) {
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        auto& layer = layers_[i];
+        if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
+            RecurrentKind kind = layer.kind == Kind::rnn ? RecurrentKind::rnn :
+                layer.kind == Kind::lstm ? RecurrentKind::lstm : RecurrentKind::gru;
+            cells_[i].emplace(kind, static_cast<int>(layer.input.elements()), layer.filters,
+                               static_cast<unsigned>(rng()));
+            continue;
+        }
         if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
         const std::size_t count = static_cast<std::size_t>(layer.filters);
         layer.biases.assign(count, 0.0f);
@@ -46,7 +54,13 @@ void Network::save_weights(const std::string& path) const {
     const std::uint64_t seen = 0;
     file.write(reinterpret_cast<const char*>(version), sizeof(version));
     file.write(reinterpret_cast<const char*>(&seen), sizeof(seen));
-    for (const auto& layer : layers_) {
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        const auto& layer = layers_[i];
+        if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
+            if (!cells_[i]) throw std::runtime_error("cannot save uninitialized rnn/lstm/gru weights");
+            write_floats(file, cells_[i]->parameter_values());
+            continue;
+        }
         if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
         write_floats(file, layer.biases);
         if (layer.batch_normalize) {
@@ -79,6 +93,10 @@ Trainer::Trainer(Network& network, LearningRateSchedule schedule, int batch_size
     if (batch_size < 1) throw std::runtime_error("invalid batch size");
     if (!std::isfinite(momentum) || momentum < 0 || momentum >= 1) throw std::runtime_error("invalid momentum");
     if (!std::isfinite(bn_momentum) || bn_momentum <= 0 || bn_momentum >= 1) throw std::runtime_error("invalid batch-norm momentum");
+    for (const auto& layer : network_.layers_)
+        if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru)
+            throw std::runtime_error("the detector Trainer does not support rnn/lstm/gru layers; "
+                                      "use ClassificationTrainer for sequence-classification cfgs");
     weight_grad_.resize(network_.layers_.size());
     bias_grad_.resize(network_.layers_.size());
     scale_grad_.resize(network_.layers_.size());

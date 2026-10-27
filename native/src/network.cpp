@@ -156,6 +156,12 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
         if (shape.c != static_cast<int>(layer.anchors.size()) * (layer.classes + 5))
             throw std::runtime_error("region channels must equal anchor count * (classes + 5)");
         return shape;
+    case Kind::rnn:
+    case Kind::lstm:
+    case Kind::gru:
+        // Hidden state is a flat vector regardless of the (flattened) input shape; one
+        // forward()/classify() call is one timestep (see Network::reset_sequence()).
+        return {layer.filters, 1, 1};
     }
     throw std::runtime_error("unsupported layer kind");
 }
@@ -296,6 +302,10 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
             out = source;  // no-op at inference, matching Darknet (dropout only affects training)
         } else if (layer.kind == Kind::reorg) {
             reorg_forward(source, out, layer.input.c, layer.input.h, layer.input.w, layer.stride);
+        } else if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
+            RecurrentCell* cell = net.cell_at(index);
+            if (!cell) throw std::runtime_error("initialize or load weights before inference");
+            out = cell->step(source);
         } else {
             out = source;
             heads.push_back({index, out});
@@ -426,6 +436,17 @@ Network Network::from_cfg(const std::string& path) {
             layer.noobject_scale = floating(section, "noobject_scale", "1");
             layer.class_scale = floating(section, "class_scale", "1");
             layer.coord_scale = floating(section, "coord_scale", "1");
+        } else if (section.name == "rnn" || section.name == "lstm" || section.name == "gru") {
+            // Darknet's rnn_layer.c/lstm_layer.c/gru_layer.c (char-sequence models, not detector
+            // heads): `output` is the hidden size; each forward()/classify() call processes one
+            // timestep, with hidden state persisting in the Network across calls (see
+            // RecurrentCell/Network::reset_sequence()) rather than a batched time dimension -
+            // this project's single-pass-per-sample graph has no separate time axis to thread
+            // through every other layer kind, so a cfg mixing spatial (conv/route/...) layers
+            // with a recurrent layer is unsupported (not rejected here, but untested/undefined).
+            layer.kind = section.name == "rnn" ? Kind::rnn : section.name == "lstm" ? Kind::lstm : Kind::gru;
+            layer.filters = integer(section, "output");
+            positive(layer.filters, "rnn/lstm/gru output");
         } else {
             throw std::runtime_error("unsupported layer [" + section.name + "] at line " + std::to_string(section.line));
         }
@@ -433,6 +454,10 @@ Network Network::from_cfg(const std::string& path) {
         layer.output.elements();
         shape = layer.output;
         net.layers_.push_back(std::move(layer));
+        // Left unset (not yet "initialize or load weights before inference") until
+        // initialize_random() or load_weights() lazily constructs it - mirrors how
+        // convolutional/connected layers start with empty weights/biases vectors.
+        net.cells_.push_back(std::nullopt);
     }
     if (net.layers_.empty() ||
         (std::none_of(net.layers_.begin(), net.layers_.end(),
@@ -446,12 +471,23 @@ void Network::resize(int width, int height) {
     positive(width, "width"); positive(height, "height");
     input_.h = height; input_.w = width;
     Shape shape = input_;
-    for (auto& layer : layers_) {
+    for (std::size_t i = 0; i < layers_.size(); ++i) {
+        auto& layer = layers_[i];
         layer.input = shape;
         layer.output = layer_output_shape(layer, shape, layers_);
         layer.output.elements();
+        // A recurrent cell's input_size is fixed at construction (from_cfg); multiscale resizing
+        // a cfg that also contains an rnn/lstm/gru layer is unsupported (the two features were
+        // never meant to combine - resize exists for spatial detector heads, rnn layers are for
+        // flat sequence inputs with no spatial dimension to jitter).
+        if (cells_[i] && cells_[i]->input_size() != static_cast<int>(layer.input.elements()))
+            throw std::runtime_error("resize is unsupported for cfgs containing an rnn/lstm/gru layer");
         shape = layer.output;
     }
+}
+
+void Network::reset_sequence() {
+    for (auto& cell : cells_) if (cell) cell->reset_sequence();
 }
 
 void Network::load_weights(const std::string& path, int layer_limit) {
@@ -466,6 +502,16 @@ void Network::load_weights(const std::string& path, int layer_limit) {
     std::size_t limit = partial ? std::min(static_cast<std::size_t>(layer_limit), layers_.size()) : layers_.size();
     for (std::size_t i = 0; i < limit; ++i) {
         auto& layer = layers_[i];
+        if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
+            RecurrentKind kind = layer.kind == Kind::rnn ? RecurrentKind::rnn :
+                layer.kind == Kind::lstm ? RecurrentKind::lstm : RecurrentKind::gru;
+            if (!cells_[i]) cells_[i].emplace(kind, static_cast<int>(layer.input.elements()), layer.filters, 0u);
+            std::vector<float> flat;
+            read_floats(file, flat, cells_[i]->parameters().size(), i);
+            auto pointers = cells_[i]->parameters();
+            for (std::size_t p = 0; p < pointers.size(); ++p) *pointers[p] = flat[p];
+            continue;
+        }
         if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
         auto count = static_cast<std::size_t>(layer.filters);
         read_floats(file, layer.biases, count, i);
@@ -488,6 +534,9 @@ std::vector<Head> Network::forward(const std::vector<float>& input, Backend back
     if (input.size() != input_.elements()) throw std::runtime_error("input does not match cfg shape");
     for (const auto& layer : layers_) if ((layer.kind == Kind::convolutional || layer.kind == Kind::connected) && layer.biases.empty())
         throw std::runtime_error("load weights before inference");
+    for (std::size_t i = 0; i < layers_.size(); ++i)
+        if ((layers_[i].kind == Kind::rnn || layers_[i].kind == Kind::lstm || layers_[i].kind == Kind::gru) && !cells_[i])
+            throw std::runtime_error("load weights before inference");
     if (backend == Backend::cpu) return cpu_forward(*this, input);
 #ifdef DETECTOR_HAS_CUDA
     if (backend == Backend::cuda) return forward_cuda(*this, input);

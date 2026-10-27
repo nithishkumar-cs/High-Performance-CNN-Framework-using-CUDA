@@ -256,6 +256,13 @@ struct CudaSession::Impl {
                 check(cudaMemcpy(head.values.data(), result, head.values.size() * sizeof(float), cudaMemcpyDeviceToHost),
                       "cudaMemcpy softmax output");
                 heads.push_back(std::move(head));
+            } else if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
+                // Not yet ported to CUDA inference (only the CPU Network/ClassificationTrainer
+                // path and the standalone cuda_recurrent.cu sequence runner support rnn/lstm/gru
+                // so far) - fail loudly instead of silently mis-copying through the YOLO-head
+                // fallback below (whose byte count assumes output.elements() == input.elements(),
+                // false for a recurrent layer's hidden size).
+                throw std::runtime_error("rnn/lstm/gru layers are not supported by the CUDA inference backend yet; use Backend::cpu");
             } else {
                 check(cudaMemcpy(result, previous, layer.output.elements() * sizeof(float), cudaMemcpyDeviceToDevice),
                       "cudaMemcpy YOLO head");

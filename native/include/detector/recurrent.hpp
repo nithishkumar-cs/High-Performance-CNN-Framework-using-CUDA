@@ -35,14 +35,19 @@ public:
     // elements.
     const std::vector<float>& step(const std::vector<float>& input);
 
-    // Backpropagates one full cached sequence's hidden-state-output gradients through time
+    // Backpropagates one full cached chunk's hidden-state-output gradients through time
     // (reverse order internally). `dh_targets[t]` is dLoss/dh_t injected directly at timestep t
     // (e.g. from a loss computed on that timestep's output); pass an all-zero vector for
     // timesteps with no direct loss contribution - the recurrent dependency still carries
     // gradient backward through earlier timesteps regardless. Must be called with exactly as
-    // many entries as step() was called since the last reset_sequence(). Adds to (does not
-    // reset) the internal gradient accumulators - call zero_gradients() first for a fresh
-    // accumulation. Returns dLoss/dInput for every timestep, same order as the step() calls.
+    // many entries as step() was called since the last reset_sequence() or backward_through_time()
+    // call, whichever is more recent - this call clears the cached chunk (but NOT h_/c_) on
+    // return, so the next step() starts a fresh chunk while still carrying hidden/cell state
+    // forward, enabling truncated BPTT over a long sequence as consecutive bounded chunks
+    // (Darknet rnn.c's time_steps-per-batch pattern) without needing the whole sequence's
+    // timesteps cached for one backward_through_time call. Adds to (does not reset) the
+    // internal gradient accumulators - call zero_gradients() first for a fresh accumulation.
+    // Returns dLoss/dInput for every timestep, same order as the step() calls.
     std::vector<std::vector<float>> backward_through_time(const std::vector<std::vector<float>>& dh_targets);
 
     void zero_gradients();

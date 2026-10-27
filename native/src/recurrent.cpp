@@ -235,6 +235,11 @@ std::vector<std::vector<float>> RecurrentCell::backward_through_time(
             transpose_matvec_accumulate(dh_carry, gates_[1].wh, hidden_size_, hidden_size_, dr);
         }
     }
+    // Clears the cached chunk (but not h_/c_) so the next step() call starts a fresh cache
+    // while still carrying hidden/cell state forward - enables truncated BPTT over a long
+    // sequence as consecutive bounded chunks (Darknet rnn.c's time_steps-per-batch pattern)
+    // without requiring the whole sequence's timesteps in one backward_through_time call.
+    cache_.clear();
     return dinputs;
 }
 

@@ -7,8 +7,9 @@
 
 namespace detector {
 
-// A Jetson-built TensorRT plan with the same two raw YOLO head outputs as the
-// ONNX exporter. Preprocessing and decode/NMS remain in detector_core.
+// A Jetson-built TensorRT plan with the same raw YOLO/region head outputs (one
+// per [yolo]/[region] layer in the network, in layer order) as the ONNX
+// exporter. Preprocessing and decode/NMS remain in detector_core.
 class TrtSession {
 public:
     TrtSession(const Network& network, const std::string& engine_path);

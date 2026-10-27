@@ -1,10 +1,14 @@
-"""Export this project's supported Darknet YOLOv3-tiny graph to standard ONNX.
+"""Export this project's supported Darknet detector graphs to standard ONNX.
 
 Inputs are a matching Darknet .cfg and .weights; no PyTorch or upstream Darknet
-source is used. The two outputs are raw NCHW YOLO head logits. Letterboxing,
-YOLO decoding, and NMS intentionally remain outside the ONNX graph so the same
-postprocessor can be used for native CUDA and TensorRT accuracy comparisons.
-The input cfg may be an adaptation of pjreddie/darknet's yolov3-tiny.cfg; see
+source is used. Supports convolutional/maxpool/route/upsample/shortcut bodies
+with one or more [yolo] and/or [region] heads - i.e. YOLOv3-tiny (2 heads),
+full YOLOv3/Darknet-53 (3 heads, using shortcut for its residual blocks), and
+YOLOv2/Darknet19 (1 region head). Outputs are raw NCHW YOLO/region head
+logits, one per head in layer order. Letterboxing, decode, and NMS
+intentionally remain outside the ONNX graph so the same postprocessor can be
+used for native CUDA and TensorRT accuracy comparisons. The input cfg may be
+an adaptation of a pjreddie/darknet cfg; see
 https://github.com/pjreddie/darknet/blob/master/LICENSE before redistribution.
 """
 
@@ -71,7 +75,7 @@ def sha256(path: Path) -> str:
 
 
 def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
-    """Convert this project's supported Darknet YOLOv3-tiny cfg+weights to an ONNX model at `output`; returns a summary dict."""
+    """Convert this project's supported Darknet detector cfg+weights (YOLOv3-tiny/full YOLOv3-Darknet-53/YOLOv2-region) to an ONNX model at `output`; returns a summary dict."""
     sections = sections_from(cfg)
     net = sections[0][1]
     channels, height, width = (int(net[key]) for key in ("channels", "height", "width"))
@@ -174,11 +178,29 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
                                           nearest_mode="floor"))
             shape = (c, h * stride, w * stride)
             previous = name
-        elif kind == "yolo":
-            masks = integers(options["mask"])
+        elif kind == "shortcut":
+            from_raw = int(options["from"])
+            source = len(tensors) + from_raw if from_raw < 0 else from_raw
+            if source < 0 or source >= len(tensors):
+                raise ValueError(f"shortcut references missing layer at {index}")
+            if shapes[source] != shape:
+                raise ValueError(f"shortcut shape mismatch at layer {index}")
+            activation = options.get("activation", "linear")
+            if activation not in ("linear", "leaky"):
+                raise ValueError(f"unsupported shortcut activation {activation} at layer {index}")
+            add_name = f"{name}_add" if activation == "leaky" else name
+            nodes.append(helper.make_node("Add", [previous, tensors[source]], [add_name], name=add_name))
+            if activation == "leaky":
+                nodes.append(helper.make_node("LeakyRelu", [add_name], [name], name=f"{name}_leaky", alpha=0.1))
+            previous = name
+        elif kind in ("yolo", "region"):
+            if kind == "yolo":
+                anchor_count = len(integers(options["mask"]))
+            else:
+                anchor_count = int(options.get("num", "1"))
             count = int(options["classes"])
-            if c != len(masks) * (count + 5) or (classes is not None and classes != count):
-                raise ValueError(f"YOLO head channels/classes disagree at layer {index}")
+            if c != anchor_count * (count + 5) or (classes is not None and classes != count):
+                raise ValueError(f"{kind} head channels/classes disagree at layer {index}")
             classes = count
             head_name = f"head_{head_count}"
             nodes.append(helper.make_node("Identity", [previous], [head_name],
@@ -193,10 +215,10 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
             raise ValueError(f"invalid output shape at layer {index}")
         tensors.append(previous)
         shapes.append(shape)
-    if head_count != 2 or cursor != floats.size:
-        raise ValueError(f"expected two complete YOLO heads; got {head_count}, "
+    if head_count < 1 or cursor != floats.size:
+        raise ValueError(f"expected at least one complete YOLO/region head; got {head_count}, "
                          f"unused floats={floats.size - cursor}")
-    graph = helper.make_graph(nodes, "darknet_yolov3_tiny_raw_heads",
+    graph = helper.make_graph(nodes, "darknet_detector_raw_heads",
                               [helper.make_tensor_value_info(
                                   "images", TensorProto.FLOAT, [1, channels, height, width])],
                               outputs, initializer=initializers)
@@ -206,7 +228,7 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
     metadata = {"darknet_cfg_sha256": sha256(cfg),
                 "darknet_weights_sha256": sha256(weights),
                 "darknet_images_seen": str(seen),
-                "output_semantics": "raw NCHW YOLO head logits; decode and NMS external"}
+                "output_semantics": "raw NCHW YOLO/region head logits; decode and NMS external"}
     for key, value in metadata.items():
         item = model.metadata_props.add()
         item.key, item.value = key, value

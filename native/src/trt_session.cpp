@@ -79,17 +79,17 @@ struct TrtSession::Impl {
 
     Impl(const Network& network, const std::string& path) {
         for (std::size_t index = 0; index < network.layers().size(); ++index)
-            if (network.layers()[index].kind == Kind::yolo)
+            if (network.layers()[index].kind == Kind::yolo || network.layers()[index].kind == Kind::region)
                 heads.emplace_back(index, network.layers()[index].output);
-        if (heads.size() != 2)
-            throw std::runtime_error("TensorRT backend expects two YOLOv3-tiny heads");
+        if (heads.empty())
+            throw std::runtime_error("TensorRT backend expects at least one [yolo]/[region] head");
         auto data = read_engine(path);
         runtime.reset(nvinfer1::createInferRuntime(logger));
         if (!runtime) throw std::runtime_error("TensorRT runtime creation failed");
         engine.reset(runtime->deserializeCudaEngine(data.data(), data.size()));
         if (!engine) throw std::runtime_error("TensorRT engine deserialization failed; rebuild on this Jetson");
-        if (engine->getNbIOTensors() != 3)
-            throw std::runtime_error("TensorRT engine must have one input and two raw head outputs");
+        if (engine->getNbIOTensors() != static_cast<int>(heads.size()) + 1)
+            throw std::runtime_error("TensorRT engine must have one input and one raw head output per [yolo]/[region] layer");
         expect_tensor(*engine, "images", nvinfer1::TensorIOMode::kINPUT, network.input_shape());
         for (std::size_t index = 0; index < heads.size(); ++index) {
             auto name = std::string("head_") + std::to_string(index);

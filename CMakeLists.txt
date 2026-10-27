@@ -75,6 +75,9 @@ target_link_libraries(cuda_detector_eval PRIVATE detector_core)
 add_executable(cuda_classifier native/src/classifier_main.cpp)
 target_link_libraries(cuda_classifier PRIVATE detector_core)
 
+add_executable(rnn_text native/src/rnn_text_main.cpp)
+target_link_libraries(rnn_text PRIVATE detector_core)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(detector_tests native/tests/smoke.cpp)
@@ -126,6 +129,9 @@ if(BUILD_TESTING)
     add_test(NAME classifier_cli_cpu
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
         $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-linear.cfg)
+    add_test(NAME rnn_text_cli
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_rnn_text_cli.py
+        $<TARGET_FILE:rnn_text> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/rnn-text.cfg)
     if(DETECTOR_CUDA)
       add_test(NAME detector_cuda_gpu_selection
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_detector_gpu_selection.py

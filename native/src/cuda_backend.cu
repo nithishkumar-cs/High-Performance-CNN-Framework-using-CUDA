@@ -1,6 +1,10 @@
 #include "detector/cuda_session.hpp"
+#ifdef DETECTOR_HAS_CUDNN
+#include "detector/cudnn_backend.hpp"
+#endif
 #include <cuda_runtime.h>
 #include <cmath>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -28,6 +32,7 @@ struct DeviceMemory {
     }
 };
 
+#ifndef DETECTOR_HAS_CUDNN
 __global__ void convolution(const float* input, const float* weights, const float* multiplier,
                             const float* offset, float* output, int icount, int ih, int iw,
                             int ocount, int oh, int ow, int kernel, int stride, int pad, bool leaky) {
@@ -50,6 +55,19 @@ __global__ void convolution(const float* input, const float* weights, const floa
     float value = sum * multiplier[oc] + offset[oc];
     output[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
+#endif
+
+#ifdef DETECTOR_HAS_CUDNN
+/** Applies the same BN affine transform and activation after cuDNN's raw convolution. */
+__global__ void convolution_epilogue(float* values, const float* multiplier, const float* offset,
+                                    int count, int plane, bool leaky) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= count) return;
+    int channel = pos / plane;
+    float value = values[pos] * multiplier[channel] + offset[channel];
+    values[pos] = leaky && value < 0 ? value * 0.1f : value;
+}
+#endif
 
 __global__ void max_pool(const float* input, float* output, int channels, int ih, int iw,
                          int oh, int ow, int kernel, int stride) {
@@ -126,6 +144,7 @@ void launch_check() { check(cudaGetLastError(), "CUDA kernel launch"); }
 
 }  // namespace
 
+/** Owns the uploaded graph and cached cuDNN convolution contexts for one inference session. */
 struct CudaSession::Impl {
     struct ConvolutionParameters { float* weights = nullptr; float* scales = nullptr; float* offsets = nullptr; };
     const Network& network;
@@ -133,7 +152,11 @@ struct CudaSession::Impl {
     float* input = nullptr;
     std::vector<float*> output;
     std::vector<ConvolutionParameters> parameters;
+#ifdef DETECTOR_HAS_CUDNN
+    std::vector<std::unique_ptr<CudnnConvolution>> cudnn_convolutions;
+#endif
 
+    /** Uploads graph buffers and, when enabled, prepares cuDNN contexts. */
     explicit Impl(const Network& net) : network(net) {
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
@@ -142,6 +165,9 @@ struct CudaSession::Impl {
         const auto& layers = network.layers();
         output.resize(layers.size());
         parameters.resize(layers.size());
+#ifdef DETECTOR_HAS_CUDNN
+        cudnn_convolutions.resize(layers.size());
+#endif
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
             output[i] = memory.floats(layer.output.elements());
@@ -156,9 +182,15 @@ struct CudaSession::Impl {
                     offsets[c] -= layer.means[c] * multiplier[c];
                 }
             parameters[i] = {memory.upload(layer.weights), memory.upload(multiplier), memory.upload(offsets)};
+#ifdef DETECTOR_HAS_CUDNN
+            if (layer.kind == Kind::convolutional)
+                cudnn_convolutions[i] = std::make_unique<CudnnConvolution>(layer.input.c, layer.input.h,
+                    layer.input.w, layer.output.c, layer.size, layer.stride, layer.padding);
+#endif
         }
     }
 
+    /** Runs one input through the graph and downloads detection/classification heads. */
     std::vector<Head> forward(const std::vector<float>& host_input) {
         if (host_input.size() != network.input_shape().elements()) throw std::runtime_error("input does not match cfg shape");
         check(cudaMemcpy(input, host_input.data(), host_input.size() * sizeof(float), cudaMemcpyHostToDevice),
@@ -174,9 +206,15 @@ struct CudaSession::Impl {
             int blocks = (elements + threads - 1) / threads;
             if (layer.kind == Kind::convolutional) {
                 const auto& param = parameters[index];
+#ifdef DETECTOR_HAS_CUDNN
+                cudnn_convolutions[index]->forward(previous, param.weights, result);
+                convolution_epilogue<<<blocks, threads>>>(result, param.scales, param.offsets,
+                    elements, layer.output.h * layer.output.w, layer.leaky);
+#else
                 convolution<<<blocks, threads>>>(previous, param.weights, param.scales, param.offsets, result,
                     layer.input.c, layer.input.h, layer.input.w, layer.output.c, layer.output.h,
                     layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
+#endif
                 launch_check();
             } else if (layer.kind == Kind::maxpool) {
                 max_pool<<<blocks, threads>>>(previous, result, layer.input.c, layer.input.h,

@@ -1,10 +1,14 @@
 #include "detector/cuda_trainer.hpp"
 #ifdef DETECTOR_HAS_CUDA
 #include "detector/yolo_loss.hpp"
+#ifdef DETECTOR_HAS_CUDNN
+#include "detector/cudnn_backend.hpp"
+#endif
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cmath>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -17,10 +21,12 @@ void check(cudaError_t error, const char* operation) {
     if (error != cudaSuccess) throw std::runtime_error(std::string(operation) + ": " + cudaGetErrorString(error));
 }
 
+#ifndef DETECTOR_HAS_CUDNN
 /** Raises an exception when a cuBLAS operation fails. */
 void check(cublasStatus_t status, const char* operation) {
     if (status != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string(operation) + " failed: " + std::to_string(status));
 }
+#endif
 
 void launch_check() { check(cudaGetLastError(), "CUDA training kernel launch"); }
 
@@ -40,6 +46,7 @@ struct DeviceMemory {
         allocations.push_back(pointer);
         return pointer;
     }
+#ifndef DETECTOR_HAS_CUDNN
     /** Allocates tracked double precision scratch storage for parallel reductions. */
     double* doubles(std::size_t count) {
         double* pointer = nullptr;
@@ -47,6 +54,7 @@ struct DeviceMemory {
         allocations.push_back(pointer);
         return pointer;
     }
+#endif
     float* upload(const std::vector<float>& host) {
         float* pointer = floats(host.size());
         check(cudaMemcpy(pointer, host.data(), host.size() * sizeof(float), cudaMemcpyHostToDevice), "cudaMemcpy H2D");
@@ -74,6 +82,7 @@ struct DeviceMemory {
         }
         existing = ints(count);
     }
+#ifndef DETECTOR_HAS_CUDNN
     /** Replaces a tracked scratch allocation after the network changes spatial size. */
     void replace(double*& existing, std::size_t count) {
         if (existing) {
@@ -84,13 +93,47 @@ struct DeviceMemory {
         }
         existing = doubles(count);
     }
+#endif
 };
 
+#ifndef DETECTOR_HAS_CUDNN
 constexpr float kBnEps = 1e-5f;
+#endif
 constexpr int kThreads = 256;
+#ifndef DETECTOR_HAS_CUDNN
 constexpr int kReductionTile = 4096;
+#endif
 inline int blocks_for(int count) { return count > 0 ? (count + kThreads - 1) / kThreads : 1; }
 
+#ifdef DETECTOR_HAS_CUDNN
+/** Applies bias and leaky activation to cuDNN's raw convolution output. */
+__global__ void convolution_bias_activation(const float* raw, const float* bias,
+                                             float* preactivation, float* output,
+                                             int count, int plane, int channels, bool leaky) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= count) return;
+    float value = raw[pos] + bias[(pos / plane) % channels];
+    preactivation[pos] = value;
+    output[pos] = leaky && value < 0 ? value * 0.1f : value;
+}
+
+/** Applies the activation after cuDNN's batch-normalization affine transform. */
+__global__ void batch_norm_activation(const float* preactivation, float* output, int count, bool leaky) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= count) return;
+    float value = preactivation[pos];
+    output[pos] = leaky && value < 0 ? value * 0.1f : value;
+}
+
+/** Recovers biased batch variance from cuDNN's saved inverse standard deviation. */
+__global__ void inverse_variance_to_variance(const float* inverse, float* variance, int count) {
+    int pos = blockIdx.x * blockDim.x + threadIdx.x;
+    if (pos >= count) return;
+    variance[pos] = fmaxf(0.0f, 1.0f / (inverse[pos] * inverse[pos]) - 1e-5f);
+}
+#endif
+
+#ifndef DETECTOR_HAS_CUDNN
 /** Expands one CHW image into a position-major matrix for cuBLAS convolutions. */
 __global__ void convolution_im2col(const float* input, float* columns, int channels, int ih, int iw,
                                    int oh, int ow, int kernel, int stride, int pad) {
@@ -206,6 +249,7 @@ __global__ void batch_norm_apply(const float* raw, const float* mean, const floa
     preactivation[pos] = value;
     output[pos] = leaky && value < 0 ? value * 0.1f : value;
 }
+#endif
 
 __global__ void update_running_stats(float* running_mean, float* running_variance, const float* mean,
                                      const float* variance, int filters, float momentum) {
@@ -309,6 +353,7 @@ __global__ void activation_backward(float* gradient, const float* preactivation,
     if (pos < count && leaky && preactivation[pos] < 0) gradient[pos] *= 0.1f;
 }
 
+#ifndef DETECTOR_HAS_CUDNN
 __global__ void batch_norm_backward_partial(const float* g, const float* raw, const float* mean,
                                             const float* variance, const float* gamma, double* partial,
                                             int filters, int plane, int sample_stride, int chunks) {
@@ -380,6 +425,7 @@ __global__ void batch_norm_backward_dz(float* g, const float* raw, const float* 
     float dxhat = g[pos] * gamma[oc];
     g[pos] = inv_std / total_n * (total_n * dxhat - sum_dxhat[oc] - xhat * sum_dxhat_xhat[oc]);
 }
+#endif
 
 __global__ void bias_grad_reduce(const float* dz, float* bias_grad_accum, int filters, int plane) {
     int oc = blockIdx.x * blockDim.x + threadIdx.x;
@@ -458,19 +504,28 @@ struct CudaTrainer::Impl {
     float bn_momentum;
     int iteration;
     DeviceMemory memory;
+#ifndef DETECTOR_HAS_CUDNN
     cublasHandle_t blas = nullptr;
     std::size_t column_capacity = 1;
     float* columns = nullptr;
     float* column_gradient = nullptr;
     std::size_t bn_partial_capacity = 1;
     double* bn_partial = nullptr;
+#endif
     float* input = nullptr;
     std::vector<float*> output, preactivation, gradient;
-    std::vector<float*> raw, batch_mean, batch_var, sum_dxhat, sum_dxhat_xhat, running_mean, running_variance;
+    std::vector<float*> raw, batch_mean, batch_var, sum_dxhat, running_mean, running_variance;
+#ifndef DETECTOR_HAS_CUDNN
+    std::vector<float*> sum_dxhat_xhat;
+#endif
     std::vector<float*> weights, biases, scales;
     std::vector<float*> weight_grad_accum, bias_grad_accum, scale_grad_accum;
     std::vector<float*> weight_velocity, bias_velocity, scale_velocity;
     std::vector<int*> max_index;
+#ifdef DETECTOR_HAS_CUDNN
+    std::vector<std::unique_ptr<CudnnConvolution>> cudnn_convolutions;
+    std::vector<std::unique_ptr<CudnnBatchNorm>> cudnn_batch_norms;
+#endif
 
     /** Initializes parameters, spatial buffers, and a full-precision matrix multiplication handle. */
     Impl(Network& net, LearningRateSchedule sched, int batch, float decay, float sgd_momentum, float bn_mom,
@@ -503,12 +558,19 @@ struct CudaTrainer::Impl {
         std::size_t n = layers.size();
         output.resize(n); preactivation.resize(n, nullptr); gradient.resize(n);
         raw.resize(n, nullptr); batch_mean.resize(n, nullptr); batch_var.resize(n, nullptr);
-        sum_dxhat.resize(n, nullptr); sum_dxhat_xhat.resize(n, nullptr);
+        sum_dxhat.resize(n, nullptr);
+#ifndef DETECTOR_HAS_CUDNN
+        sum_dxhat_xhat.resize(n, nullptr);
+#endif
         running_mean.resize(n, nullptr); running_variance.resize(n, nullptr);
         weights.resize(n, nullptr); biases.resize(n, nullptr); scales.resize(n, nullptr);
         weight_grad_accum.resize(n, nullptr); bias_grad_accum.resize(n, nullptr); scale_grad_accum.resize(n, nullptr);
         weight_velocity.resize(n, nullptr); bias_velocity.resize(n, nullptr); scale_velocity.resize(n, nullptr);
         max_index.resize(n, nullptr);
+#ifdef DETECTOR_HAS_CUDNN
+        cudnn_convolutions.resize(n);
+        cudnn_batch_norms.resize(n);
+#endif
         for (std::size_t i = 0; i < n; ++i) {
             const auto& layer = layers[i];
             output[i] = memory.floats(batch_elems * layer.output.elements());
@@ -523,7 +585,12 @@ struct CudaTrainer::Impl {
             if (layer.kind != Kind::convolutional) continue;
             preactivation[i] = memory.floats(batch_elems * layer.output.elements());
             std::size_t fan_in = static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
+#ifndef DETECTOR_HAS_CUDNN
             column_capacity = std::max(column_capacity, fan_in * static_cast<std::size_t>(layer.output.h) * layer.output.w);
+#else
+            cudnn_convolutions[i] = std::make_unique<CudnnConvolution>(layer.input.c, layer.input.h,
+                layer.input.w, layer.output.c, layer.size, layer.stride, layer.padding);
+#endif
             if (layer.weights.size() != fan_in * layer.output.c || layer.biases.size() != static_cast<std::size_t>(layer.output.c))
                 throw std::runtime_error("initialize or load detector weights before CUDA training");
             weights[i] = memory.upload(layer.weights);
@@ -533,8 +600,13 @@ struct CudaTrainer::Impl {
             weight_velocity[i] = memory.floats(layer.weights.size());
             bias_velocity[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
             if (layer.batch_normalize) {
+#ifndef DETECTOR_HAS_CUDNN
                 int chunks = (layer.output.h * layer.output.w + kReductionTile - 1) / kReductionTile;
                 bn_partial_capacity = std::max(bn_partial_capacity, batch_elems * layer.output.c * chunks * 4);
+#else
+                cudnn_batch_norms[i] = std::make_unique<CudnnBatchNorm>(layer.output.c,
+                    layer.output.h, layer.output.w);
+#endif
                 if (layer.scales.size() != static_cast<std::size_t>(layer.output.c) ||
                     layer.means.size() != static_cast<std::size_t>(layer.output.c) ||
                     layer.variances.size() != static_cast<std::size_t>(layer.output.c))
@@ -543,7 +615,9 @@ struct CudaTrainer::Impl {
                 batch_mean[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 batch_var[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 sum_dxhat[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
+#ifndef DETECTOR_HAS_CUDNN
                 sum_dxhat_xhat[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
+#endif
                 scales[i] = memory.upload(layer.scales);
                 scale_grad_accum[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
                 scale_velocity[i] = memory.floats(static_cast<std::size_t>(layer.output.c));
@@ -551,15 +625,19 @@ struct CudaTrainer::Impl {
                 running_variance[i] = memory.upload(layer.variances);
             }
         }
+#ifndef DETECTOR_HAS_CUDNN
         columns = memory.floats(column_capacity);
         column_gradient = memory.floats(column_capacity);
         bn_partial = memory.doubles(bn_partial_capacity);
         check(cublasCreate(&blas), "cublasCreate");
         check(cublasSetMathMode(blas, CUBLAS_PEDANTIC_MATH), "cublasSetMathMode");
+#endif
     }
 
+#ifndef DETECTOR_HAS_CUDNN
     /** Releases the matrix multiplication handle before tracked CUDA allocations. */
     ~Impl() { if (blas) cublasDestroy(blas); }
+#endif
 
     // Darknet-style multiscale resize: recomputes every layer's shape on `network` for a new
     // input width/height, then reallocates only the spatial-dimension-sized buffers (input,
@@ -573,8 +651,10 @@ struct CudaTrainer::Impl {
         network.resize(width, height);
         const auto& layers = network.layers();
         memory.replace(input, static_cast<std::size_t>(batch_size) * network.input_shape().elements());
+#ifndef DETECTOR_HAS_CUDNN
         column_capacity = 1;
         bn_partial_capacity = 1;
+#endif
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
             std::size_t elems = static_cast<std::size_t>(batch_size) * layer.output.elements();
@@ -583,19 +663,31 @@ struct CudaTrainer::Impl {
             if (layer.kind == Kind::maxpool) { memory.replace(max_index[i], elems); continue; }
             if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout) { memory.replace(preactivation[i], elems); continue; }
             if (layer.kind != Kind::convolutional) continue;
+#ifdef DETECTOR_HAS_CUDNN
+            cudnn_convolutions[i] = std::make_unique<CudnnConvolution>(layer.input.c, layer.input.h,
+                layer.input.w, layer.output.c, layer.size, layer.stride, layer.padding);
+            if (layer.batch_normalize)
+                cudnn_batch_norms[i] = std::make_unique<CudnnBatchNorm>(layer.output.c,
+                    layer.output.h, layer.output.w);
+#else
             column_capacity = std::max(column_capacity, static_cast<std::size_t>(layer.input.c) * layer.size * layer.size *
                                                        layer.output.h * layer.output.w);
+#endif
             memory.replace(preactivation[i], elems);
             if (layer.batch_normalize) {
                 memory.replace(raw[i], elems);
+#ifndef DETECTOR_HAS_CUDNN
                 int chunks = (layer.output.h * layer.output.w + kReductionTile - 1) / kReductionTile;
                 bn_partial_capacity = std::max(bn_partial_capacity,
                                                static_cast<std::size_t>(batch_size) * layer.output.c * chunks * 4);
+#endif
             }
         }
+#ifndef DETECTOR_HAS_CUDNN
         memory.replace(columns, column_capacity);
         memory.replace(column_gradient, column_capacity);
         memory.replace(bn_partial, bn_partial_capacity);
+#endif
     }
 
     // `inputs.size()` (== n) must be between 1 and `batch_size`; device buffers are sample-major
@@ -608,7 +700,9 @@ struct CudaTrainer::Impl {
         if (targets.size() != n) throw std::runtime_error("inputs/targets length mismatch");
         const auto& layers = network.layers();
         std::size_t input_elems = network.input_shape().elements();
+#ifndef DETECTOR_HAS_CUDNN
         const float one = 1.0f, zero_beta = 0.0f;
+#endif
         for (std::size_t s = 0; s < n; ++s) {
             if (inputs[s].size() != input_elems) throw std::runtime_error("training input shape mismatch");
             check(cudaMemcpy(input + s * input_elems, inputs[s].data(), input_elems * sizeof(float), cudaMemcpyHostToDevice),
@@ -629,6 +723,17 @@ struct CudaTrainer::Impl {
             if (layer.kind == Kind::convolutional) {
                 int plane = layer.output.h * layer.output.w;
                 if (layer.batch_normalize) {
+#ifdef DETECTOR_HAS_CUDNN
+                    cudnn_convolutions[i]->forward(previous_of(0), weights[i], raw[i], static_cast<int>(n));
+                    cudnn_batch_norms[i]->forward(raw[i], scales[i], biases[i], preactivation[i],
+                        running_mean[i], running_variance[i], batch_mean[i], sum_dxhat[i], static_cast<int>(n));
+                    inverse_variance_to_variance<<<blocks_for(layer.output.c), kThreads>>>(
+                        sum_dxhat[i], batch_var[i], layer.output.c);
+                    launch_check();
+                    batch_norm_activation<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(
+                        preactivation[i], output[i], static_cast<int>(n * elems), layer.leaky);
+                    launch_check();
+#else
                     int key_count = layer.input.c * layer.size * layer.size;
                     for (std::size_t s = 0; s < n; ++s) {
                         convolution_im2col<<<blocks_for(key_count * plane), kThreads>>>(previous_of(s), columns,
@@ -652,16 +757,25 @@ struct CudaTrainer::Impl {
                             scales[i], biases[i], preactivation[i] + s * elems, output[i] + s * elems, elements, plane, layer.leaky);
                         launch_check();
                     }
+#endif
                     update_running_stats<<<blocks_for(layer.output.c), kThreads>>>(running_mean[i], running_variance[i],
                         batch_mean[i], batch_var[i], layer.output.c, bn_momentum);
                     launch_check();
                 } else {
+#ifdef DETECTOR_HAS_CUDNN
+                    cudnn_convolutions[i]->forward(previous_of(0), weights[i], preactivation[i], static_cast<int>(n));
+                    convolution_bias_activation<<<blocks_for(static_cast<int>(n * elems)), kThreads>>>(
+                        preactivation[i], biases[i], preactivation[i], output[i],
+                        static_cast<int>(n * elems), plane, layer.output.c, layer.leaky);
+                    launch_check();
+#else
                     for (std::size_t s = 0; s < n; ++s) {
                         convolution_forward_plain<<<blocks_for(elements), kThreads>>>(previous_of(s), weights[i], biases[i],
                             preactivation[i] + s * elems, output[i] + s * elems, layer.input.c, layer.input.h, layer.input.w,
                             layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky);
                         launch_check();
                     }
+#endif
                 }
             } else if (layer.kind == Kind::maxpool) {
                 for (std::size_t s = 0; s < n; ++s) {
@@ -823,6 +937,13 @@ struct CudaTrainer::Impl {
                     launch_check();
                 }
                 if (layer.batch_normalize) {
+#ifdef DETECTOR_HAS_CUDNN
+                    cudnn_batch_norms[reverse]->backward(raw[reverse], gradient[reverse], scales[reverse],
+                        batch_mean[reverse], sum_dxhat[reverse], preactivation[reverse],
+                        scale_grad_accum[reverse], bias_grad_accum[reverse], static_cast<int>(n));
+                    check(cudaMemcpy(gradient[reverse], preactivation[reverse], n * elems * sizeof(float),
+                                     cudaMemcpyDeviceToDevice), "cudaMemcpy cuDNN BN gradient");
+#else
                     int chunks = (plane + kReductionTile - 1) / kReductionTile;
                     dim3 grid(chunks, layer.output.c, static_cast<unsigned int>(n));
                     batch_norm_backward_partial<<<grid, kThreads>>>(gradient[reverse], raw[reverse],
@@ -840,6 +961,7 @@ struct CudaTrainer::Impl {
                             elements, plane, total_n);
                         launch_check();
                     }
+#endif
                 } else {
                     for (std::size_t s = 0; s < n; ++s) {
                         bias_grad_reduce<<<blocks_for(layer.output.c), kThreads>>>(gradient[reverse] + s * elems, bias_grad_accum[reverse],
@@ -847,6 +969,13 @@ struct CudaTrainer::Impl {
                         launch_check();
                     }
                 }
+#ifdef DETECTOR_HAS_CUDNN
+                cudnn_convolutions[reverse]->backward_filter(previous_of(0), gradient[reverse],
+                    weight_grad_accum[reverse], static_cast<int>(n));
+                if (reverse)
+                    cudnn_convolutions[reverse]->backward_data(weights[reverse], gradient[reverse],
+                        prev_grad_of(0), static_cast<int>(n));
+#else
                 for (std::size_t s = 0; s < n; ++s) {
                     int key_count = layer.input.c * layer.size * layer.size;
                     convolution_im2col<<<blocks_for(key_count * plane), kThreads>>>(previous_of(s), columns,
@@ -866,6 +995,7 @@ struct CudaTrainer::Impl {
                         launch_check();
                     }
                 }
+#endif
             }
         }
 

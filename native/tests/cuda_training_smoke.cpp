@@ -153,7 +153,9 @@ void check_parity_resize(const std::string& cfg, int steps, const char* label) {
     detector::CudaTrainer gpu_trainer(gpu_net, detector::LearningRateSchedule{0.01f}, 1, 0.0005f);
     std::vector<detector::Target> targets{{0, 0.5f, 0.5f, 0.25f, 0.25f}};
 
-    std::vector<float> small_input(cpu_net.input_shape().elements(), 0.2f);
+    std::vector<float> small_input(cpu_net.input_shape().elements());
+    for (std::size_t i = 0; i < small_input.size(); ++i)
+        small_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
     float cpu_loss = 0, gpu_loss = 0;
     for (int i = 0; i < steps; ++i) {
         cpu_loss = cpu_trainer.step({small_input}, {targets}).loss;
@@ -163,7 +165,9 @@ void check_parity_resize(const std::string& cfg, int steps, const char* label) {
     cpu_trainer.resize(8, 8);
     gpu_trainer.resize(8, 8);
     expect(cpu_net.input_shape().h == 8 && gpu_net.input_shape().h == 8, "resize did not take effect");
-    std::vector<float> large_input(cpu_net.input_shape().elements(), 0.2f);
+    std::vector<float> large_input(cpu_net.input_shape().elements());
+    for (std::size_t i = 0; i < large_input.size(); ++i)
+        large_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
     for (int i = 0; i < steps; ++i) {
         cpu_loss = cpu_trainer.step({large_input}, {targets}).loss;
         gpu_loss = gpu_trainer.step({large_input}, {targets}).loss;
@@ -218,7 +222,9 @@ int main() {
             return 0;
         }
         auto directory = std::filesystem::path(__FILE__).parent_path();
-        std::vector<float> graph_input(detector::Network::from_cfg((directory / "mini.cfg").string()).input_shape().elements(), 0.2f);
+        std::vector<float> graph_input(detector::Network::from_cfg((directory / "mini.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < graph_input.size(); ++i)
+            graph_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
         check_parity((directory / "mini.cfg").string(), graph_input, {{0, 0.5f, 0.5f, 0.25f, 0.25f}}, 5, 1, "bn_5step");
 
         std::vector<float> shortcut_input{0.3f};

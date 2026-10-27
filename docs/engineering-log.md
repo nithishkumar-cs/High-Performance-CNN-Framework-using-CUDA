@@ -141,9 +141,37 @@ YOLO inference path.
 - Measured on a same-seed 160-image pilot on an unchanged checkpoint: **86.58s → 9.93s**
   (≈8.7x), with identical loss/positive counts and checkpoint floats matching the unoptimized
   path to within 7.63e-6 absolute / no difference above 1e-3 across 67M floats — a performance
-  rewrite verified bit-for-bit equivalent, not just "looks right."
+  rewrite verified numerically equivalent, not just "looks right."
 - Cut the retrain's measured epoch time from ~12.4h to ~4.46h with the earlier busy-wait fix, then
   further with this kernel rewrite — observed ~3-4 minutes/epoch on the resumed run.
+
+**2026-10-25 — A second useful native detector architecture.**
+- The full-budget YOLOv2/Darknet19 retrain completed and scored 0.56054 validation / 0.57215
+  test mAP@0.5 on VOC2007 with this project's CUDA evaluator. This confirmed that the framework
+  trains a second, structurally different detector rather than only YOLOv3-tiny.
+
+**2026-10-26 — Full YOLOv3/Darknet-53 training and validation.**
+- Parsed and trained the real 106-layer, three-head YOLOv3 graph using its ImageNet-pretrained
+  Darknet-53 prefix. An initial learning rate of 0.001 diverged in epoch 2; 0.0001 completed all
+  71 epochs at batch 8 on the 8 GB laptop GPU.
+- The resulting native checkpoint scored **0.62098 validation / 0.61593 test mAP@0.5**, the best
+  of this project's three completed detector architectures. The full validation result was also
+  reproduced with the new cuDNN inference path (501 images, 1,305 objects, 2,853 predictions).
+
+**2026-10-26 — cuDNN integration measured against the existing cuBLAS path.**
+- Staged cuDNN from the no-account pip wheel and generated the missing Windows import library
+  from the shipped DLL exports, making the build reproducible without a separate SDK download.
+- Wired cached cuDNN convolution forward/backward and spatial batch normalization into optional
+  CUDA inference and training. Forward/backward direct-sum checks and CPU/CUDA minibatch parity,
+  including different samples and resize, passed.
+- A same-seed YOLOv2 320-image batch-8 pilot took 11.4s with batched cuDNN versus 12.8s with
+  cuBLAS at LR 0.0001. This is one short throughput comparison; the default remains cuBLAS while
+  cuDNN is selected by `DETECTOR_CUDNN=ON`. The loss trajectories were close but not identical.
+
+**2026-10-26 — RNN/LSTM/GRU forward and backpropagation through time.**
+- Implemented all three recurrent cell kinds independently on CPU and CUDA. CPU finite-difference
+  checks cover gate parameters; the CUDA test compares every timestep output, input gradient and
+  parameter gradient with the CPU path. Sequence-to-cfg graph integration remains open.
 
 ## Bugs found and fixed (debugging skills, concrete)
 
@@ -161,6 +189,9 @@ YOLO inference path.
 5. **GPU kernel hotspot** — direct convolution and serial BN reductions, found by profiling
    (Nsight Systems) rather than guessing; fixed with cuBLAS SGEMM + tiled parallel reductions,
    verified numerically equivalent before being trusted on a multi-day run.
+6. **Deep-head training divergence** — the first full YOLOv3/Darknet-53 run reached non-finite
+   loss in epoch 2 at LR 0.001 with momentum 0.9. A controlled tenfold LR reduction completed
+   the 71-epoch run and yielded the strongest detector checkpoint.
 
 ## Methodology/skills demonstrated
 
@@ -178,3 +209,5 @@ YOLO inference path.
 - Faithful reproduction of a published reference system (Darknet/YOLO) from its config format and
   source semantics, without copying its source, including reproducing subtle loss-function
   details that materially change accuracy.
+- GPU backend changes validated at several scales: independent convolution sums, CPU/CUDA
+  parameter parity, a real 320-image throughput pilot, and same-evaluator full validation mAP.

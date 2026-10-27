@@ -19,6 +19,7 @@ enum class RecurrentKind { rnn, lstm, gru };
 
 class RecurrentCell {
 public:
+    /** Initializes one RNN, LSTM, or GRU cell with positive input and hidden sizes. */
     RecurrentCell(RecurrentKind kind, int input_size, int hidden_size, unsigned seed);
 
     RecurrentKind kind() const { return kind_; }
@@ -53,6 +54,8 @@ public:
     // accumulated gradient, for finite-difference gradient-check tests.
     std::vector<float*> parameters();
     std::vector<float*> gradients();
+    /** Returns learnable parameters in the same flattened order as parameters(). */
+    std::vector<float> parameter_values() const;
 
 private:
     struct Gate {

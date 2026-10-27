@@ -68,6 +68,8 @@ std::vector<float> RecurrentCell::matvec(const std::vector<float>& matrix, int r
 
 RecurrentCell::RecurrentCell(RecurrentKind kind, int input_size, int hidden_size, unsigned seed)
     : kind_(kind), input_size_(input_size), hidden_size_(hidden_size) {
+    if (input_size < 1 || hidden_size < 1)
+        throw std::runtime_error("RecurrentCell sizes must be positive");
     unsigned state = seed ? seed : 1u;
     gates_.resize(gate_count(kind));
     for (Gate& gate : gates_) gate = make_gate(state);
@@ -150,6 +152,9 @@ std::vector<std::vector<float>> RecurrentCell::backward_through_time(
     const std::vector<std::vector<float>>& dh_targets) {
     if (dh_targets.size() != cache_.size())
         throw std::runtime_error("RecurrentCell::backward_through_time: dh_targets size mismatch");
+    for (const auto& dh : dh_targets)
+        if (dh.size() != static_cast<std::size_t>(hidden_size_))
+            throw std::runtime_error("RecurrentCell::backward_through_time: hidden gradient size mismatch");
     const int T = static_cast<int>(cache_.size());
     std::vector<std::vector<float>> dinputs(T, std::vector<float>(input_size_, 0.0f));
     std::vector<float> dh_carry(hidden_size_, 0.0f);
@@ -266,6 +271,16 @@ std::vector<float*> RecurrentCell::gradients() {
         for (float& w : gate.dwx) result.push_back(&w);
         for (float& w : gate.dwh) result.push_back(&w);
         for (float& w : gate.db) result.push_back(&w);
+    }
+    return result;
+}
+
+std::vector<float> RecurrentCell::parameter_values() const {
+    std::vector<float> result;
+    for (const Gate& gate : gates_) {
+        result.insert(result.end(), gate.wx.begin(), gate.wx.end());
+        result.insert(result.end(), gate.wh.begin(), gate.wh.end());
+        result.insert(result.end(), gate.b.begin(), gate.b.end());
     }
     return result;
 }

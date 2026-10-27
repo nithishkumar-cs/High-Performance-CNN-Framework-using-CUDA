@@ -1,19 +1,33 @@
-# Framework scope and status
+# Framework status
 
-The project goal is an independently implemented C++/CUDA neural-network framework that can configure, train, save, load, and run more than one model, plus measured Jetson inference. It is inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet), not a fork or a claim of Darknet source compatibility beyond the supported layer/weight subset. YOLOv3-tiny is one validation workload; the original Darknet trainer was used externally for the reported VOC2007 weights.
+This project is an independent C++/CUDA neural-network framework inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet). It keeps the original CUDA CNN in Git history and implements configurable training and inference in `native/`. Supported Darknet cfg layers and weight files are compatible where documented; unsupported layers fail explicitly.
 
-## Implemented now
+## Working paths
 
-- Config-driven inference graph with convolution, max-pooling, dense (`[connected]`), route, upsample, YOLO heads, and terminal softmax. Unsupported layers fail explicitly. Classifiers can use different layer topologies and class counts; YOLOv3-tiny inference is retained.
-- CPU reference SGD training for simple convolutional/dense/softmax classifiers with cross-entropy and batch size one, with fixed batch-normalization statistics/scales. CUDA SGD training supports sequential convolution, max-pooling, and dense layers followed by softmax, also at batch size one; batch normalization is not supported in its training path. A separate CPU YOLO trainer uses a simplified objective; it has not trained a useful YOLOv3-tiny model.
-- Darknet-style weight load/save for the supported layers, an IDX/MNIST dataset adapter, and a classifier CLI for CPU training and CPU/CUDA inference. Config examples are in `native/examples/`.
-- Jetson native CUDA inference for classifiers and YOLOv3-tiny; the classifier tests compare CPU and CUDA probabilities and one-step parameter updates. Linear, MLP, and convolutional classifiers were trained end-to-end with this project's CUDA trainer on full MNIST and evaluated on the held-out test set; see the [MNIST Jetson report](mnist-jetson.md). The YOLOv3-tiny path also has optional ONNX export and TensorRT inference, with [Jetson measurements](onnx-tensorrt.md).
+- Config-driven CPU/CUDA graph inference and training for convolution, max-pooling, connected, route, shortcut, upsample, reorg, dropout, YOLO and region heads, and terminal softmax. Batch normalization is trainable with true minibatch statistics in the detector trainers. Classifier examples cover linear, MLP and CNN models.
+- RNN, LSTM and GRU cfg layers have persistent sequence state, CPU/CUDA inference, and truncated backpropagation through time in the CPU/CUDA classifier trainers. The detector trainers reject recurrent layers with a clear error.
+- Native CUDA detector training includes anchor assignment and YOLO/region loss, crop/flip/HSV augmentation, multiscale resizing, burn-in/step-decay scheduling, SGD momentum and weight decay. The default large-convolution path uses cuBLAS; cuDNN convolution and spatial batch normalization are available with `-DDETECTOR_CUDNN=ON`.
+- CUDA detector training can use multiple selected devices via `--gpus 0,1`: one replica per device, balanced shards of the total `--batch`, concurrent local steps, and sample-weighted state synchronization after each global step. The one-GPU path and weighted synchronization math are tested. This laptop has only one GPU, so an actual two-GPU run and its throughput have not been measured.
+- Darknet-format weight load/save, partial backbone initialization, checkpoint step/epoch resume, IDX/MNIST classifier CLI, native detection/evaluation, and Jetson inference. ONNX/TensorRT is optional and currently specific to YOLOv3-tiny's two-head graph.
 
-## Not yet implemented or proven
+## Measured model results
 
-- CUDA backward/update for route, upsample, YOLO heads, and trainable batch normalization. The current CUDA trainer supports sequential classifiers, not general branched graphs or detector training.
-- General minibatch training, trainable batch-normalization statistics/scales, additional losses/optimizers, data augmentation, and the layer coverage needed for full YOLOv3/Darknet-53 or arbitrary upstream configs.
-- Faithful Darknet YOLO training and a model trained end-to-end by this framework with competitive VOC accuracy. The existing VOC2007 YOLOv3-tiny checkpoint was trained by **original Darknet**, not by this framework.
-- A broad or tuned classifier benchmark. The measured MNIST results are for fixed-epoch linear, MLP, and small CNN models; per-sample timing includes transfer overhead and has no warmup. The synthetic 4×4 tests cover convergence and CPU/CUDA parity across configs.
+All detector scores below use the same native CUDA evaluator with confidence 0.01, class-aware NMS IoU 0.45 and all-point AP@0.5. VOC2007 labels were converted without difficult objects; these are not official VOC leaderboard scores.
 
-The next substantial milestone is reusable CUDA training for branched graphs, trainable batch normalization, and a faithful YOLO detection loss/target pipeline. Keep the full-dataset MNIST and YOLOv3-tiny evaluations as regression benchmarks.
+| Checkpoint origin and architecture | Validation: 501 images, 1,305 objects | Test: 4,952 images, 12,032 objects |
+| --- | ---: | ---: |
+| This framework, YOLOv3-tiny with COCO backbone initialization | 0.59801 | 0.58182 |
+| This framework, YOLOv2 / Darknet19 with pretrained backbone | 0.56054 | 0.57215 |
+| This framework, full YOLOv3 / Darknet-53 with pretrained backbone | 0.62098 | 0.61593 |
+| Historical original-Darknet YOLOv3-tiny weights, evaluated here | 0.57612 | 0.55534 |
+
+The corrected native YOLOv3-tiny checkpoint was also evaluated on Jetson with native CUDA and TensorRT FP32/FP16. Historical full-dataset MNIST Jetson runs of the project's classifier trainer scored 97.24% test accuracy for an MLP and 97.27% for a small CNN.
+
+## Current limits
+
+- This is the supported subset of Darknet's cfg vocabulary, not an arbitrary upstream cfg interpreter. A same-evaluator external-Darknet YOLOv2 baseline has not been run.
+- Actual multi-GPU execution needs a host with at least two CUDA devices. Each device uses local batch-normalization statistics during its forward/backward pass; running statistics are averaged between devices. The current cross-device state transfer uses host memory, and its throughput is unmeasured.
+- Full YOLOv3 and YOLOv2 have native CPU/CUDA inference and training, but the optional ONNX/TensorRT export/inference path still targets YOLOv3-tiny only.
+- Native training from scratch has not produced a useful VOC detector; the measured native checkpoints above use pretrained backbones.
+
+See [engineering milestones](engineering-log.md) and [the training design](../DESIGN.yaml) for the implementation and validation history.

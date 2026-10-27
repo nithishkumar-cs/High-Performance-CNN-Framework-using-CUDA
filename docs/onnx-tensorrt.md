@@ -1,10 +1,35 @@
 # Darknet YOLOv3-tiny to ONNX and TensorRT
 
-This path deploys the **same trained Darknet YOLOv3-tiny model** reported in [the VOC2007 training guide](yolov3-tiny-training.md). It does not train a new architecture or use Ultralytics/PyTorch. `native/tools/export_darknet_onnx.py` reads the 20-class Darknet `.cfg` and `.weights` directly and writes standard ONNX operators. No Darknet source is copied into this project. The input `.cfg` is an adaptation of [pjreddie/darknet's YOLOv3-tiny config](https://github.com/pjreddie/darknet/blob/master/cfg/yolov3-tiny.cfg); retain its attribution header and consult the upstream [LICENSE](https://github.com/pjreddie/darknet/blob/master/LICENSE) and [MIT notice](https://github.com/pjreddie/darknet/blob/master/LICENSE.mit) before redistributing it.
+This optional path deploys the project's **native-trained YOLOv3-tiny checkpoint**. The later section preserves measurements from the historical checkpoint trained with original Darknet. It does not train a new architecture or use Ultralytics/PyTorch. `native/tools/export_darknet_onnx.py` reads the 20-class Darknet `.cfg` and `.weights` directly and writes standard ONNX operators. No Darknet source is copied into this project. The input `.cfg` is an adaptation of [pjreddie/darknet's YOLOv3-tiny config](https://github.com/pjreddie/darknet/blob/master/cfg/yolov3-tiny.cfg); retain its attribution header and consult the upstream [LICENSE](https://github.com/pjreddie/darknet/blob/master/LICENSE) and [MIT notice](https://github.com/pjreddie/darknet/blob/master/LICENSE.mit) before redistributing it.
 
 The exported ONNX graph has fixed input `images: float32[1,3,416,416]` and two **raw**, unactivated NCHW YOLO logits outputs, `head_0: [1,75,13,13]` and `head_1: [1,75,26,26]`. It folds Darknet batch normalization into convolutions and uses standard Conv, LeakyRelu, MaxPool, Identity, Resize, and Concat nodes. Letterboxing, sigmoid/box decoding, confidence filtering, class-aware NMS, and inverse letterboxing remain outside the graph. The optional TensorRT backend returns these same raw heads to the existing native C++ decoder/evaluator; no custom YOLO plugin is needed.
 
-## Rebuild from the trained weights
+## Selected native-trained checkpoint (2026-10-12)
+
+The laptop-trained `runs/yolov3-tiny-voc-pretrained-full-budget-corrected.weights` (SHA-256 `25acc5731ca6ba53b25db0350a0564550acad2661d6bef78e17b969df6809841`) is the selected Jetson deployment checkpoint. Export with the same 20-class cfg:
+
+```sh
+python3 native/tools/export_darknet_onnx.py \
+  --cfg runs/yolov3-tiny-voc/yolov3-tiny-voc.cfg \
+  --weights runs/yolov3-tiny-voc-pretrained-full-budget-corrected.weights \
+  --output runs/yolov3-tiny-voc-pretrained-full-budget-corrected.onnx
+```
+
+The evaluated ONNX file had SHA-256 `692ba3711c1b92c49266ee574ee936fb045891f61c04ec0c34d9af9e78636d24`. TensorRT engines were built on the Jetson from that ONNX model, then all three backends were evaluated with confidence 0.01 and class-aware NMS IoU 0.45. Validation contained 501 images and 1,305 non-difficult objects; test contained 4,952 images and 12,032 such objects.
+
+| Backend | Validation mAP@0.5 | Test mAP@0.5 | Network mean | In-memory pipeline mean |
+| --- | ---: | ---: | ---: | ---: |
+| Native CUDA | 0.60006 | 0.58119 | 91.138 ms | 100.346 ms |
+| TensorRT FP32 | 0.60016 | 0.58103 | 6.386 ms | 19.083 ms |
+| TensorRT FP16 | 0.59888 | 0.58066 | 3.742 ms | 12.216 ms |
+
+Timing used five warmups and 30 measured iterations on the same test image in the board's existing power mode. Network timing includes transfer and synchronization; pipeline timing adds in-memory preprocessing and decode/NMS. Both exclude file I/O and model setup. The slight mAP differences are numerical/backend variation. The laptop native CUDA checkpoint scored 0.59801 validation / 0.58182 test with PPM inputs; Jetson evaluated JPEG inputs. These are this project's AP@0.5 calculations, not official VOC leaderboard scores.
+
+## Historical external-Darknet checkpoint
+
+The following commands and measurements use the earlier checkpoint trained by original Darknet. They remain as a baseline, not as evidence of native detector training.
+
+### Rebuild from those weights
 
 On a machine with Python, `numpy` and `onnx` installed (the optional exporter test also needs `onnxruntime`):
 
@@ -50,7 +75,7 @@ ctest --test-dir build-trt --output-on-failure
 
 For `--backend tensorrt`, the model argument is the `.engine`, **not** the Darknet `.weights`. The `.cfg` is still needed for the shared YOLO decoder. The runtime validates the engine's input/output names, shapes, and float32 I/O before inference. Its plan files are executable, hardware-/TensorRT-version-specific artifacts: only deserialize engines you built or trust, and rebuild on another device/version as needed. See NVIDIA's [TensorRT runtime guidance](https://docs.nvidia.com/deeplearning/tensorrt/latest/inference-library/c-api-docs.html) and [TensorRT 10.x API migration](https://docs.nvidia.com/deeplearning/tensorrt/10.x.x/api/tensorrt-8x-to-10x-c-api.html).
 
-## Jetson results
+### Historical Jetson results
 
 All three backends used the same trained 20-class model, image, 416x416 input, existing Jetson Orin 25W power mode, native letterbox/decode/NMS, confidence 0.01 and NMS IoU 0.45 for AP evaluation. All validation and test images were processed (no `--limit`). The test split had 4,952 images and 12,032 non-difficult ground-truth objects.
 

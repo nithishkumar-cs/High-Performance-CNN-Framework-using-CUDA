@@ -1,12 +1,18 @@
-# CUDA Neural Network Framework (in progress)
+# CUDA Neural Network Framework
 
-An independently written C++/CUDA neural-network framework project inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet). It is not a fork and does not contain Darknet source. The goal is reusable training and inference across multiple models, with Jetson inference as a deployment target. **This goal is not complete yet.** The original fixed-shape MNIST CUDA CNN remains in this repository; `native/` is the newer configurable graph implementation. See the [scope and remaining work](docs/framework-status.md).
+An independently written C++/CUDA neural-network framework inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet). It is not a fork and does not contain Darknet source. `native/` contains the configurable framework; the original fixed-shape MNIST CUDA CNN remains in the repository. Training runs on the laptop GPU and Jetson is an inference target. See [current support and limits](docs/framework-status.md).
 
-The graph currently supports convolution, max-pooling, dense (`[connected]`), route, upsample, YOLO heads, and terminal softmax. Configurable classifier examples include [linear](native/examples/mnist-linear.cfg), [two-layer dense](native/examples/mnist-mlp.cfg), and [convolutional](native/examples/mnist-conv.cfg) models. The IDX/MNIST CLI supports CPU or native CUDA SGD and inference for all three (batch size one, with no trainable batch normalization). The separate experimental YOLO CPU trainer has a simplified loss and is **not** equivalent to Darknet training.
+The graph supports convolution, max-pooling, dense (`[connected]`), route, shortcut, upsample, reorg, dropout, YOLO and region detector heads, softmax, and RNN/LSTM/GRU layers. Classifiers and detectors have CPU and CUDA training paths; recurrent classifiers support sequence inference and truncated backpropagation through time on both. Detector training uses true minibatches, trainable batch normalization, augmentation, a learning-rate schedule, and SGD momentum. Optional cuDNN kernels can replace the default cuBLAS convolution path. Unsupported cfg layers fail explicitly.
 
-The YOLOv3-tiny application loads compatible Darknet `.weights` on CPU or CUDA and provides letterboxing, two-head decoding, class-aware NMS, benchmarking, and AP@0.5 evaluation. It remains a model validation case, not the whole framework.
+Three detector architectures have been trained end to end by this framework on VOC2007 with pretrained backbones. Using the same native CUDA evaluator at confidence 0.01 and class-aware NMS IoU 0.45:
 
-For an actual 20-class YOLOv3-tiny model, the [VOC2007 training workflow](docs/yolov3-tiny-training.md) uses the unmodified original Darknet GPU trainer **externally** and evaluates its weights in this native engine. The completed 10,000-batch Jetson run reached **0.57379 validation mAP@0.5** (501 images); that validation-selected final checkpoint reached **0.55534 test mAP@0.5** (4,952 images). This is this project's all-point AP calculation on converted VOC labels, not an official VOC leaderboard score. The final local checkpoint and logs are in ignored `runs/yolov3-tiny-voc/`. No upstream source, original config, pretrained weights, dataset, or trained checkpoint is committed. The [optional ONNX/TensorRT path](docs/onnx-tensorrt.md) exports **these same Darknet weights** and runs FP32/FP16 engines through the same C++ YOLO decoder on Jetson. FP16 reached **0.55595 test mAP@0.5** and 11.970 ms mean in-memory pipeline time; ONNX/TensorRT are not required for native Darknet-format inference.
+| Native-trained architecture | Validation mAP@0.5, 501 images | Test mAP@0.5, 4,952 images |
+| --- | ---: | ---: |
+| YOLOv3-tiny | 0.59801 | 0.58182 |
+| YOLOv2 / Darknet19 | 0.56054 | 0.57215 |
+| Full YOLOv3 / Darknet-53 | 0.62098 | 0.61593 |
+
+These are this project's all-point AP calculations on converted VOC labels excluding difficult objects, not official VOC leaderboard scores. The earlier **external-Darknet** YOLOv3-tiny checkpoint remains a historical comparison (0.57612 validation / 0.55534 test with the comparable native evaluator); it is not evidence of native training. Checkpoints, datasets and run logs are local ignored artifacts. The corrected native YOLOv3-tiny checkpoint was evaluated on Jetson with native CUDA and optional TensorRT FP32/FP16; see [Jetson results](docs/onnx-tensorrt.md).
 
 Build on Jetson Orin with CUDA and OpenCV development libraries:
 
@@ -16,9 +22,9 @@ cmake --build build -j4
 ctest --test-dir build --output-on-failure
 ```
 
-For CPU-only builds, use `-DDETECTOR_CUDA=OFF` and omit `CMAKE_CUDA_ARCHITECTURES`. Without OpenCV, input images must be PPM. Select the CUDA architecture for your GPU.
+For CPU-only builds, use `-DDETECTOR_CUDA=OFF` and omit `CMAKE_CUDA_ARCHITECTURES`. Add `-DDETECTOR_CUDNN=ON` to an existing CUDA build to use the optional cuDNN kernels after staging the SDK with `native/tools/setup_cudnn.ps1`. Without OpenCV, input images must be PPM. Select the CUDA architecture for your GPU.
 
-Train and evaluate a classifier from standard MNIST IDX files on Jetson. The downloaded files are in ignored `data/mnist/`; the [measured full-dataset runs](docs/mnist-jetson.md) reached **97.24% test accuracy** for a two-layer dense model and **97.27%** for a small CNN. Use a fresh output checkpoint name because the CLI refuses to overwrite existing weights:
+Train future models on the laptop GPU. The historical [full-dataset MNIST Jetson runs](docs/mnist-jetson.md) reached **97.24% test accuracy** for a two-layer dense model and **97.27%** for a small CNN. Use a fresh output checkpoint name because the CLI refuses to overwrite existing weights:
 
 ```sh
 ./build/cuda_classifier train native/examples/mnist-mlp.cfg data/mnist/train-images-idx3-ubyte data/mnist/train-labels-idx1-ubyte runs/mnist/retrain-mlp.weights --backend cuda --epochs 3 --lr 0.01
@@ -34,4 +40,6 @@ Train and evaluate a classifier from standard MNIST IDX files on Jetson. The dow
 
 For TensorRT, export with `native/tools/export_darknet_onnx.py`, build the engine on the Jetson, and configure with `-DDETECTOR_TENSORRT=ON`; see the [tested commands and results](docs/onnx-tensorrt.md). Full YOLOv3 is not required for this path.
 
-Do not pair 80-class COCO weights with the 20-class VOC config. The included `native/tests/voc-smoke.cfg` is **not** YOLOv3-tiny. See [scope and Jetson measurements](docs/native-detector.md) for the implementation's limits.
+Detector training accepts `--backend cuda --gpus 0,1 --batch N` on a host with two GPUs; `N` is the total minibatch size. The default is GPU 0. The code synchronizes learned weights, momentum and batch-normalization running state after each global step. This laptop has one RTX 3070 Ti, so two-device execution and throughput remain unmeasured. Its one-GPU path and synchronization math have CUDA regression tests.
+
+Do not pair 80-class COCO weights with the 20-class VOC config. The included `native/tests/voc-smoke.cfg` is **not** YOLOv3-tiny. See [current framework status](docs/framework-status.md) for the implementation's limits.

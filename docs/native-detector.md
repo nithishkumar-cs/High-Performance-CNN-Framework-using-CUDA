@@ -1,5 +1,7 @@
 # Native detector: scope and measured status
 
+**Historical snapshot:** this page records the early YOLOv3-tiny inference and CPU pilot stage. Its statements about unsupported full YOLOv3, missing native CUDA detector training and no useful native detector are superseded by [current framework status](framework-status.md) and the [engineering log](engineering-log.md). The original measurements below remain for provenance.
+
 This repository builds an independent C++/CUDA detector inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet), without copying or forking its source. The original MNIST CUDA CNN remains in the source tree and Git history. Earlier unrelated PyTorch/Ultralytics work was reversed locally without rewriting history; ignored local `data/` and `runs/` were retained. No upstream `.cfg`, pretrained `.weights`, or dataset files are committed.
 
 ## What works

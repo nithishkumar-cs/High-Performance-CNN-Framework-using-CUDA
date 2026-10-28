@@ -248,6 +248,7 @@ void exercise_cuda_training(const fs::path& cfg) {
 }
 #endif
 
+/** Exercises CPU/CUDA classifier training, sequence state, and checkpoint parity. */
 int main() {
     try {
         fs::path directory = fs::path(__FILE__).parent_path();
@@ -264,10 +265,12 @@ int main() {
         exercise_single_step_parity(directory / "classifier-linear.cfg");
         exercise_single_step_parity(directory / "classifier-dense.cfg");
         exercise_single_step_parity(directory / "classifier-conv.cfg");
+        exercise_single_step_parity(directory / "l2norm-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "lstm-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "gru-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-conv-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "rnn-l2norm-classifier.cfg");
 #endif
         return 0;
     } catch (const std::exception& error) {

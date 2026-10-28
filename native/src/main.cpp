@@ -78,6 +78,7 @@ std::vector<std::string> read_names(const std::string& path) {
     return names;
 }
 
+/** Names a layer kind for inspect output. */
 const char* kind_name(detector::Kind kind) {
     switch (kind) {
     case detector::Kind::convolutional: return "conv";
@@ -91,6 +92,10 @@ const char* kind_name(detector::Kind kind) {
     case detector::Kind::dropout: return "dropout";
     case detector::Kind::reorg: return "reorg";
     case detector::Kind::region: return "region";
+    case detector::Kind::rnn: return "rnn";
+    case detector::Kind::lstm: return "lstm";
+    case detector::Kind::gru: return "gru";
+    case detector::Kind::l2norm: return "l2norm";
     }
     return "unknown";
 }

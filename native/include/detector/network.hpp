@@ -18,7 +18,7 @@ struct Shape {
     std::size_t elements() const;
 };
 
-enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region, rnn, lstm, gru };
+enum class Kind { convolutional, maxpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region, rnn, lstm, gru, l2norm };
 enum class Backend { cpu, cuda, tensorrt };
 
 struct Layer {

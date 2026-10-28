@@ -303,6 +303,7 @@ void check_data_parallel_batch_norm(const std::string& cfg) {
 
 }  // namespace
 
+/** Checks CUDA detector training against the CPU reference across supported layer kinds. */
 int main() {
     try {
 #ifdef DETECTOR_HAS_CUDA
@@ -339,6 +340,11 @@ int main() {
         std::vector<float> reorg_input(detector::Network::from_cfg((directory / "reorg-train.cfg").string()).input_shape().elements());
         for (std::size_t i = 0; i < reorg_input.size(); ++i) reorg_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
         check_parity((directory / "reorg-train.cfg").string(), reorg_input, {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 1, "reorg");
+
+        std::vector<float> norm_input(detector::Network::from_cfg((directory / "l2norm-train.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < norm_input.size(); ++i) norm_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        check_parity((directory / "l2norm-train.cfg").string(), norm_input,
+                     {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 2, "l2norm");
 
         check_dropout_runs((directory / "dropout-train.cfg").string(), {0.4f}, {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 20);
 

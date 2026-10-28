@@ -1,4 +1,5 @@
 #include "detector/network.hpp"
+#include "detector/l2norm.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -131,6 +132,7 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
     case Kind::upsample:
         return {shape.c, shape.h * layer.stride, shape.w * layer.stride};
     case Kind::dropout:
+    case Kind::l2norm:
         return shape;
     case Kind::reorg: {
         if (shape.h % layer.stride != 0 || shape.w % layer.stride != 0)
@@ -213,6 +215,7 @@ void reorg_forward(const std::vector<float>& input, std::vector<float>& output,
             }
 }
 
+/** Runs one input through the CPU graph and returns its detection or classification heads. */
 std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& input) {
     const auto& layers = net.layers();
     std::vector<std::vector<float>> outputs(layers.size());
@@ -300,6 +303,8 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
             heads.push_back({index, out});
         } else if (layer.kind == Kind::dropout) {
             out = source;  // no-op at inference, matching Darknet (dropout only affects training)
+        } else if (layer.kind == Kind::l2norm) {
+            l2norm_forward(source.data(), out.data(), out.size());
         } else if (layer.kind == Kind::reorg) {
             reorg_forward(source, out, layer.input.c, layer.input.h, layer.input.w, layer.stride);
         } else if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
@@ -321,6 +326,7 @@ std::size_t Shape::elements() const {
     return static_cast<std::size_t>(c) * h * w;
 }
 
+/** Parses supported cfg layers into a graph, rejecting unknown or inconsistent shapes. */
 Network Network::from_cfg(const std::string& path) {
     auto sections = sections_from(path);
     if (sections.empty() || sections.front().name != "net") throw std::runtime_error("cfg must start with [net]");
@@ -366,6 +372,8 @@ Network Network::from_cfg(const std::string& path) {
             layer.dropout_probability = floating(section, "probability", "0.5");
             if (!(layer.dropout_probability > 0.0f && layer.dropout_probability < 1.0f))
                 throw std::runtime_error("dropout probability must be in (0,1)");
+        } else if (section.name == "l2norm") {
+            layer.kind = Kind::l2norm;
         } else if (section.name == "reorg") {
             layer.kind = Kind::reorg;
             layer.stride = integer(section, "stride", "2");

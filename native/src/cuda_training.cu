@@ -1,6 +1,7 @@
 #include "detector/cuda_trainer.hpp"
 #ifdef DETECTOR_HAS_CUDA
 #include "detector/yolo_loss.hpp"
+#include "l2norm_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
 #endif
@@ -551,9 +552,10 @@ struct CudaTrainer::Impl {
                                          "use CudaClassificationTrainer::train_sequence");
             if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::route &&
                 layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo &&
-                layer.kind != Kind::dropout && layer.kind != Kind::reorg && layer.kind != Kind::region)
+                layer.kind != Kind::dropout && layer.kind != Kind::reorg && layer.kind != Kind::region &&
+                layer.kind != Kind::l2norm)
                 throw std::runtime_error("CUDA detector training supports convolutional, maxpool, route, "
-                                           "upsample, shortcut, yolo, region, dropout and reorg layers only");
+                                           "upsample, shortcut, yolo, region, dropout, reorg and l2norm layers only");
         }
         // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
         // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
@@ -822,6 +824,9 @@ struct CudaTrainer::Impl {
                         preactivation[i] + s * elems, elements, layer.dropout_probability, keep_scale, seed);
                     launch_check();
                 }
+            } else if (layer.kind == Kind::l2norm) {
+                l2norm_forward_kernel<<<static_cast<int>(n), kThreads>>>(previous_of(0), output[i], elements);
+                launch_check();
             } else if (layer.kind == Kind::reorg) {
                 for (std::size_t s = 0; s < n; ++s) {
                     reorg_forward_kernel<<<blocks_for(elements), kThreads>>>(previous_of(s), output[i] + s * elems,
@@ -927,6 +932,12 @@ struct CudaTrainer::Impl {
                             preactivation[reverse] + s * elems, prev_grad_of(s), elements);
                         launch_check();
                     }
+            } else if (layer.kind == Kind::l2norm) {
+                if (reverse) {
+                    l2norm_backward_kernel<<<static_cast<int>(n), kThreads>>>(previous_of(0),
+                        output[reverse], gradient[reverse], prev_grad_of(0), elements);
+                    launch_check();
+                }
             } else if (layer.kind == Kind::reorg) {
                 if (reverse)
                     for (std::size_t s = 0; s < n; ++s) {

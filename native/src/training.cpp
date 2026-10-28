@@ -1,4 +1,5 @@
 #include "detector/trainer.hpp"
+#include "detector/l2norm.hpp"
 #include "detector/yolo_loss.hpp"
 #include <algorithm>
 #include <cmath>
@@ -105,6 +106,7 @@ Trainer::Trainer(Network& network, LearningRateSchedule schedule, int batch_size
     scale_velocity_.resize(network_.layers_.size());
 }
 
+/** Trains one detector minibatch and updates learned parameters once. */
 TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                            const std::vector<std::vector<Target>>& targets) {
     const std::size_t n = inputs.size();
@@ -285,6 +287,12 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                     result[p] = previous[p] * scale;
                 }
             }
+        } else if (layer.kind == Kind::l2norm) {
+            for (std::size_t s = 0; s < n; ++s) {
+                auto& result = output[s][index];
+                float inverse = l2norm_forward(previous_of(s).data(), result.data(), result.size());
+                preactivation[s][index] = {inverse};
+            }
         } else if (layer.kind == Kind::reorg) {
             // Space-to-depth rearrangement (see network.cpp's reorg_forward for the shared
             // convention); no learnable parameters, just a one-to-one position mapping.
@@ -390,6 +398,12 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                 for (std::size_t p = 0; p < grad.size(); ++p)
                     gradient[s][reverse - 1][p] += grad[p] * preactivation[s][reverse][p];
             }
+        } else if (layer.kind == Kind::l2norm) {
+            if (!reverse) continue;
+            for (std::size_t s = 0; s < n; ++s)
+                l2norm_backward(output[s][reverse].data(), gradient[s][reverse].data(),
+                                gradient[s][reverse - 1].data(), output[s][reverse].size(),
+                                preactivation[s][reverse][0]);
         } else if (layer.kind == Kind::reorg) {
             if (!reverse) continue;
             int in_plane = layer.input.h * layer.input.w;

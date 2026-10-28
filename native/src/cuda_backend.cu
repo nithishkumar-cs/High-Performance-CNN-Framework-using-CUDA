@@ -1,5 +1,6 @@
 #include "detector/cuda_session.hpp"
 #include "detector/cuda_recurrent.hpp"
+#include "l2norm_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
 #endif
@@ -245,6 +246,9 @@ struct CudaSession::Impl {
             } else if (layer.kind == Kind::dropout) {
                 check(cudaMemcpy(result, previous, layer.output.elements() * sizeof(float), cudaMemcpyDeviceToDevice),
                       "cudaMemcpy dropout");  // no-op at inference, matching Darknet
+            } else if (layer.kind == Kind::l2norm) {
+                l2norm_forward_kernel<<<1, threads>>>(previous, result, elements);
+                launch_check();
             } else if (layer.kind == Kind::reorg) {
                 reorg<<<blocks, threads>>>(previous, result, layer.input.c, layer.input.h, layer.input.w, layer.stride);
                 launch_check();

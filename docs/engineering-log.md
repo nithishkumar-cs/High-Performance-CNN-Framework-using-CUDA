@@ -223,6 +223,14 @@ YOLO inference path.
   **1246.484 / 25.476 / 11.082 ms** for full YOLOv3, in CUDA / TensorRT FP32 / FP16 order.
   TensorRT engines were built and timed on the Jetson, not transferred from the laptop.
 
+**2026-10-27 — Sample-wide L2-normalization layer.**
+- Added `[l2norm]` as a shape-preserving cfg layer across CPU/CUDA inference and both detector
+  and classifier trainers, including recurrent classifier chunks. Each sample's flattened tensor
+  is divided by its regularized L2 norm; backward propagates the full normalization Jacobian.
+- A central finite-difference check validates input gradients. Small-graph tests check zero-vector
+  behavior, CPU/CUDA inference parity, detector minibatch parameter parity, and classifier SGD
+  parity with and without an RNN sequence.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

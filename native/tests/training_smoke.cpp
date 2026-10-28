@@ -1,4 +1,5 @@
 #include "detector/trainer.hpp"
+#include "detector/l2norm.hpp"
 #include "detector/yolo_loss.hpp"
 #include <cmath>
 #include <filesystem>
@@ -13,9 +14,31 @@ void expect(bool condition, const char* message) {
 
 }  // namespace
 
-// Exercise detector training, batch-normalization gradients, and YOLO loss invariants.
+/** Exercises detector training, analytic gradients, and YOLO loss invariants. */
 int main() {
     try {
+        std::vector<float> norm_input{0.3f, -0.7f, 1.2f, -0.4f};
+        std::vector<float> norm_upstream{0.2f, -0.4f, 0.5f, 0.1f};
+        std::vector<float> norm_output(norm_input.size()), norm_gradient(norm_input.size(), 0.0f);
+        float inverse = detector::l2norm_forward(norm_input.data(), norm_output.data(), norm_input.size());
+        detector::l2norm_backward(norm_output.data(), norm_upstream.data(), norm_gradient.data(),
+                                  norm_input.size(), inverse);
+        for (std::size_t i = 0; i < norm_input.size(); ++i) {
+            constexpr float epsilon = 1e-3f;
+            std::vector<float> plus = norm_input, minus = norm_input;
+            plus[i] += epsilon;
+            minus[i] -= epsilon;
+            std::vector<float> plus_output(plus.size()), minus_output(minus.size());
+            detector::l2norm_forward(plus.data(), plus_output.data(), plus.size());
+            detector::l2norm_forward(minus.data(), minus_output.data(), minus.size());
+            float plus_loss = 0.0f, minus_loss = 0.0f;
+            for (std::size_t j = 0; j < norm_input.size(); ++j) {
+                plus_loss += plus_output[j] * norm_upstream[j];
+                minus_loss += minus_output[j] * norm_upstream[j];
+            }
+            float numeric = (plus_loss - minus_loss) / (2.0f * epsilon);
+            expect(std::abs(norm_gradient[i] - numeric) < 2e-4f, "l2norm gradient check");
+        }
         auto directory = std::filesystem::path(__FILE__).parent_path();
         auto network = detector::Network::from_cfg((directory / "train-mini.cfg").string());
         network.initialize_random(7);

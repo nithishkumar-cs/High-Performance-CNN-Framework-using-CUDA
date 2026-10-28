@@ -56,6 +56,7 @@ void write_shortcut_weights(const std::filesystem::path& path) {
 
 }  // namespace
 
+/** Exercises cfg parsing, inference, weight loading and CPU/CUDA parity on small graphs. */
 int main() {
     try {
         const auto cfg = std::filesystem::path(__FILE__).parent_path() / "mini.cfg";
@@ -75,6 +76,17 @@ int main() {
         auto boxes = detector::decode(net, heads, 0.5f, 0.45f);
         expect(boxes.size() == 16, "YOLO decode count");
         expect(boxes[0].score > 0.98f && boxes[0].score < 0.99f, "YOLO score");
+        auto norm_net = detector::Network::from_cfg((std::filesystem::path(__FILE__).parent_path() / "l2norm.cfg").string());
+        expect(norm_net.layers()[0].output.elements() == 3, "l2norm shape");
+        auto norm_cpu = norm_net.forward({3.0f, 4.0f, 0.0f}, detector::Backend::cpu);
+        const float norm_logits[3] = {0.6f, 0.8f, 0.0f};
+        float norm_exp = std::exp(norm_logits[0]) + std::exp(norm_logits[1]) + std::exp(norm_logits[2]);
+        for (int i = 0; i < 3; ++i)
+            expect(std::abs(norm_cpu[0].values[static_cast<std::size_t>(i)] -
+                            std::exp(norm_logits[i]) / norm_exp) < 1e-6f, "l2norm CPU output");
+        auto norm_zero = norm_net.forward({0.0f, 0.0f, 0.0f}, detector::Backend::cpu);
+        for (float probability : norm_zero[0].values)
+            expect(std::abs(probability - 1.0f / 3.0f) < 1e-6f, "l2norm zero vector");
         std::vector<detector::Detection> duplicates = {
             {0, 0.9f, 0, 0, 2, 2}, {0, 0.8f, 0, 0, 2, 2}, {1, 0.7f, 0, 0, 2, 2}
         };
@@ -92,6 +104,10 @@ int main() {
             expect(gpu.size() == heads.size(), "CUDA head count");
             for (std::size_t i = 0; i < heads[0].values.size(); ++i)
                 expect(std::abs(gpu[0].values[i] - heads[0].values[i]) < 1e-4f, "CPU/CUDA parity");
+            auto norm_gpu = norm_net.forward({3.0f, 4.0f, 0.0f}, detector::Backend::cuda);
+            for (std::size_t i = 0; i < norm_cpu[0].values.size(); ++i)
+                expect(std::abs(norm_gpu[0].values[i] - norm_cpu[0].values[i]) < 1e-5f,
+                       "l2norm CPU/CUDA parity");
         }
 #endif
 

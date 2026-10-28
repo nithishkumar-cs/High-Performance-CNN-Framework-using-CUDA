@@ -1,4 +1,5 @@
 #include "detector/classifier_trainer.hpp"
+#include "detector/l2norm.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -7,6 +8,7 @@
 
 namespace detector {
 
+/** Validates a sequential classifier graph and its SGD hyperparameters. */
 ClassificationTrainer::ClassificationTrainer(Network& network, float learning_rate, float weight_decay)
     : network_(network), learning_rate_(learning_rate), weight_decay_(weight_decay) {
     if (!std::isfinite(learning_rate) || learning_rate <= 0 ||
@@ -19,13 +21,14 @@ ClassificationTrainer::ClassificationTrainer(Network& network, float learning_ra
     for (const auto& layer : layers) {
         if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) { ++recurrent_count; continue; }
         if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool &&
-            layer.kind != Kind::connected && layer.kind != Kind::softmax)
+            layer.kind != Kind::connected && layer.kind != Kind::softmax && layer.kind != Kind::l2norm)
             throw std::runtime_error("classifier trainer supports convolutional, maxpool, connected, softmax, "
-                                      "and (via train_sequence()) one rnn/lstm/gru layer");
+                                      "l2norm, and (via train_sequence()) one rnn/lstm/gru layer");
     }
     if (recurrent_count > 1) throw std::runtime_error("classifier trainer supports at most one rnn/lstm/gru layer");
 }
 
+/** Applies one sample's cross-entropy SGD update to a nonrecurrent classifier. */
 ClassificationResult ClassificationTrainer::step(const std::vector<float>& input, int class_id) {
     if (input.size() != network_.input_.elements())
         throw std::runtime_error("classification input shape mismatch");
@@ -119,6 +122,8 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
                 result[static_cast<std::size_t>(oc)] =
                     layer.leaky && value < 0 ? value * 0.1f : value;
             }
+        } else if (layer.kind == Kind::l2norm) {
+            preactivation[index] = {l2norm_forward(previous.data(), result.data(), result.size())};
         } else {
             float maximum = *std::max_element(previous.begin(), previous.end());
             float total = 0.0f;
@@ -150,6 +155,10 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
             if (reverse)
                 for (std::size_t j = 0; j < grad.size(); ++j)
                     gradient[reverse - 1][max_index[reverse][j]] += grad[j];
+        } else if (layer.kind == Kind::l2norm) {
+            if (reverse)
+                l2norm_backward(output[reverse].data(), grad.data(), gradient[reverse - 1].data(),
+                                grad.size(), preactivation[reverse][0]);
         } else if (layer.kind == Kind::connected) {
             std::vector<float> weight_grad(layer.weights.size(), 0.0f);
             std::vector<float> bias_grad(layer.biases.size(), 0.0f);
@@ -208,6 +217,7 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
     return {loss, correct};
 }
 
+/** Trains one truncated-BPTT chunk while carrying recurrent state into the next chunk. */
 std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
         const std::vector<std::vector<float>>& inputs, const std::vector<int>& class_ids) {
     if (inputs.empty() || inputs.size() != class_ids.size())
@@ -317,6 +327,8 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                 }
             } else if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
                 result = network_.cells_[index]->step(previous);
+            } else if (layer.kind == Kind::l2norm) {
+                preactivation[t][index] = {l2norm_forward(previous.data(), result.data(), result.size())};
             } else {  // softmax
                 float maximum = *std::max_element(previous.begin(), previous.end());
                 float total = 0.0f;
@@ -355,6 +367,12 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                 for (std::size_t t = 0; t < T; ++t)
                     for (std::size_t j = 0; j < gradient[t][reverse].size(); ++j)
                         gradient[t][reverse - 1][max_index[t][reverse][j]] += gradient[t][reverse][j];
+        } else if (layer.kind == Kind::l2norm) {
+            if (reverse)
+                for (std::size_t t = 0; t < T; ++t)
+                    l2norm_backward(output[t][reverse].data(), gradient[t][reverse].data(),
+                                    gradient[t][reverse - 1].data(), output[t][reverse].size(),
+                                    preactivation[t][reverse][0]);
         } else if (layer.kind == Kind::connected) {
             std::vector<float> weight_grad(layer.weights.size(), 0.0f);
             std::vector<float> bias_grad(layer.biases.size(), 0.0f);

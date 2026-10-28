@@ -1,6 +1,7 @@
 #include "detector/cuda_session.hpp"
 #include "detector/cuda_recurrent.hpp"
 #include "l2norm_cuda.cuh"
+#include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
 #endif
@@ -221,6 +222,10 @@ struct CudaSession::Impl {
             } else if (layer.kind == Kind::maxpool) {
                 max_pool<<<blocks, threads>>>(previous, result, layer.input.c, layer.input.h,
                     layer.input.w, layer.output.h, layer.output.w, layer.size, layer.stride);
+                launch_check();
+            } else if (layer.kind == Kind::avgpool) {
+                avgpool_forward_kernel<<<layer.input.c, threads>>>(previous, result,
+                    layer.input.c, layer.input.h * layer.input.w);
                 launch_check();
             } else if (layer.kind == Kind::route) {
                 std::size_t offset = 0;

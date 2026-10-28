@@ -1,5 +1,6 @@
 #include "detector/trainer.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/avgpool.hpp"
 #include "detector/yolo_loss.hpp"
 #include <cmath>
 #include <filesystem>
@@ -38,6 +39,17 @@ int main() {
             }
             float numeric = (plus_loss - minus_loss) / (2.0f * epsilon);
             expect(std::abs(norm_gradient[i] - numeric) < 2e-4f, "l2norm gradient check");
+        }
+        const float average_input[8] = {1, 2, 3, 4, 2, 4, 6, 8};
+        float averages[2] = {}, average_gradient[8] = {};
+        const float upstream_average[2] = {2.0f, -4.0f};
+        detector::avgpool_forward(average_input, averages, 2, 4);
+        detector::avgpool_backward(upstream_average, average_gradient, 2, 4);
+        expect(std::abs(averages[0] - 2.5f) < 1e-6f && std::abs(averages[1] - 5.0f) < 1e-6f,
+               "global avgpool forward");
+        for (int p = 0; p < 4; ++p) {
+            expect(std::abs(average_gradient[p] - 0.5f) < 1e-6f, "global avgpool first-channel gradient");
+            expect(std::abs(average_gradient[4 + p] + 1.0f) < 1e-6f, "global avgpool second-channel gradient");
         }
         auto directory = std::filesystem::path(__FILE__).parent_path();
         auto network = detector::Network::from_cfg((directory / "train-mini.cfg").string());

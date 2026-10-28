@@ -1,5 +1,6 @@
 #include "detector/classifier_trainer.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/avgpool.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -20,9 +21,9 @@ ClassificationTrainer::ClassificationTrainer(Network& network, float learning_ra
     int recurrent_count = 0;
     for (const auto& layer : layers) {
         if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) { ++recurrent_count; continue; }
-        if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool &&
+        if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::avgpool &&
             layer.kind != Kind::connected && layer.kind != Kind::softmax && layer.kind != Kind::l2norm)
-            throw std::runtime_error("classifier trainer supports convolutional, maxpool, connected, softmax, "
+            throw std::runtime_error("classifier trainer supports convolutional, maxpool, avgpool, connected, softmax, "
                                       "l2norm, and (via train_sequence()) one rnn/lstm/gru layer");
     }
     if (recurrent_count > 1) throw std::runtime_error("classifier trainer supports at most one rnn/lstm/gru layer");
@@ -108,6 +109,8 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
                         result[pos] = best;
                         max_index[index][pos] = best_pos;
                     }
+        } else if (layer.kind == Kind::avgpool) {
+            avgpool_forward(previous.data(), result.data(), layer.input.c, layer.input.h * layer.input.w);
         } else if (layer.kind == Kind::connected) {
             if (layer.biases.size() != static_cast<std::size_t>(layer.filters) ||
                 layer.weights.size() != static_cast<std::size_t>(layer.filters) * previous.size())
@@ -155,6 +158,10 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
             if (reverse)
                 for (std::size_t j = 0; j < grad.size(); ++j)
                     gradient[reverse - 1][max_index[reverse][j]] += grad[j];
+        } else if (layer.kind == Kind::avgpool) {
+            if (reverse)
+                avgpool_backward(grad.data(), gradient[reverse - 1].data(),
+                                 layer.input.c, layer.input.h * layer.input.w);
         } else if (layer.kind == Kind::l2norm) {
             if (reverse)
                 l2norm_backward(output[reverse].data(), grad.data(), gradient[reverse - 1].data(),
@@ -313,6 +320,8 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                             result[pos] = best;
                             max_index[t][index][pos] = best_pos;
                         }
+            } else if (layer.kind == Kind::avgpool) {
+                avgpool_forward(previous.data(), result.data(), layer.input.c, layer.input.h * layer.input.w);
             } else if (layer.kind == Kind::connected) {
                 if (layer.biases.size() != static_cast<std::size_t>(layer.filters) ||
                     layer.weights.size() != static_cast<std::size_t>(layer.filters) * previous.size())
@@ -367,6 +376,11 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                 for (std::size_t t = 0; t < T; ++t)
                     for (std::size_t j = 0; j < gradient[t][reverse].size(); ++j)
                         gradient[t][reverse - 1][max_index[t][reverse][j]] += gradient[t][reverse][j];
+        } else if (layer.kind == Kind::avgpool) {
+            if (reverse)
+                for (std::size_t t = 0; t < T; ++t)
+                    avgpool_backward(gradient[t][reverse].data(), gradient[t][reverse - 1].data(),
+                                     layer.input.c, layer.input.h * layer.input.w);
         } else if (layer.kind == Kind::l2norm) {
             if (reverse)
                 for (std::size_t t = 0; t < T; ++t)

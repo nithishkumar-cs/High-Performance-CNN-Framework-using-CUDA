@@ -87,6 +87,14 @@ int main() {
         auto norm_zero = norm_net.forward({0.0f, 0.0f, 0.0f}, detector::Backend::cpu);
         for (float probability : norm_zero[0].values)
             expect(std::abs(probability - 1.0f / 3.0f) < 1e-6f, "l2norm zero vector");
+        auto average_net = detector::Network::from_cfg((std::filesystem::path(__FILE__).parent_path() / "avgpool.cfg").string());
+        expect(average_net.layers()[0].output.c == 2 && average_net.layers()[0].output.h == 1 &&
+               average_net.layers()[0].output.w == 1, "global avgpool shape");
+        std::vector<float> average_input{1.0f, 2.0f, 3.0f, 4.0f, 2.0f, 4.0f, 6.0f, 8.0f};
+        auto average_cpu = average_net.forward(average_input, detector::Backend::cpu);
+        float average_expected = std::exp(5.0f) / (std::exp(2.5f) + std::exp(5.0f));
+        expect(std::abs(average_cpu[0].values[1] - average_expected) < 1e-6f,
+               "global avgpool channel means");
         std::vector<detector::Detection> duplicates = {
             {0, 0.9f, 0, 0, 2, 2}, {0, 0.8f, 0, 0, 2, 2}, {1, 0.7f, 0, 0, 2, 2}
         };
@@ -108,6 +116,10 @@ int main() {
             for (std::size_t i = 0; i < norm_cpu[0].values.size(); ++i)
                 expect(std::abs(norm_gpu[0].values[i] - norm_cpu[0].values[i]) < 1e-5f,
                        "l2norm CPU/CUDA parity");
+            auto average_gpu = average_net.forward(average_input, detector::Backend::cuda);
+            for (std::size_t i = 0; i < average_cpu[0].values.size(); ++i)
+                expect(std::abs(average_gpu[0].values[i] - average_cpu[0].values[i]) < 1e-5f,
+                       "global avgpool CPU/CUDA parity");
         }
 #endif
 

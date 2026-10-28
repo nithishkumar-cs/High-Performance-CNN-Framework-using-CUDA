@@ -1,6 +1,7 @@
 #include "detector/cuda_classifier_trainer.hpp"
 #include "detector/cuda_recurrent.hpp"
 #include "l2norm_cuda.cuh"
+#include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDA
 #include <cuda_runtime.h>
 #include <algorithm>
@@ -295,8 +296,9 @@ struct CudaClassificationTrainer::Impl {
                 continue;
             }
             if (layers[i].kind != Kind::connected && layers[i].kind != Kind::convolutional &&
-                layers[i].kind != Kind::maxpool && layers[i].kind != Kind::l2norm)
-                throw std::runtime_error("CUDA classifier trainer supports connected, convolutional, maxpool, l2norm, one recurrent layer, and softmax");
+                layers[i].kind != Kind::maxpool && layers[i].kind != Kind::avgpool &&
+                layers[i].kind != Kind::l2norm)
+                throw std::runtime_error("CUDA classifier trainer supports connected, convolutional, maxpool, avgpool, l2norm, one recurrent layer, and softmax");
         }
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
@@ -317,7 +319,7 @@ struct CudaClassificationTrainer::Impl {
                 max_index[i] = memory.allocate_int(layer.output.elements());
                 continue;
             }
-            if (layer.kind == Kind::l2norm) continue;
+            if (layer.kind == Kind::l2norm || layer.kind == Kind::avgpool) continue;
             if (static_cast<int>(i) == recurrent_index) continue;
             const std::size_t inputs = layer.input.elements();
             std::size_t fan_in = layer.kind == Kind::connected ? inputs :
@@ -362,6 +364,9 @@ struct CudaClassificationTrainer::Impl {
             else if (layer.kind == Kind::l2norm)
                 l2norm_forward_kernel<<<1, threads>>>(previous, output[i],
                     static_cast<int>(layer.output.elements()));
+            else if (layer.kind == Kind::avgpool)
+                avgpool_forward_kernel<<<layer.input.c, threads>>>(previous, output[i],
+                    layer.input.c, layer.input.h * layer.input.w);
             else
                 maxpool_forward<<<(static_cast<int>(layer.output.elements()) + threads - 1) / threads, threads>>>(
                     previous, output[i], max_index[i], layer.input.c, layer.input.h, layer.input.w,
@@ -403,6 +408,16 @@ struct CudaClassificationTrainer::Impl {
                           "cudaMemset l2norm input gradient");
                     l2norm_backward_kernel<<<1, threads>>>(reverse ? output[reverse - 1] : input,
                         output[reverse], gradient[reverse], gradient[reverse - 1], inputs);
+                    launch_check();
+                }
+                continue;
+            }
+            if (layer.kind == Kind::avgpool) {
+                if (reverse) {
+                    check(cudaMemset(gradient[reverse - 1], 0, inputs * sizeof(float)),
+                          "cudaMemset avgpool input gradient");
+                    avgpool_backward_kernel<<<(inputs + threads - 1) / threads, threads>>>(
+                        gradient[reverse], gradient[reverse - 1], layer.input.h * layer.input.w, inputs);
                     launch_check();
                 }
                 continue;
@@ -530,6 +545,9 @@ struct CudaClassificationTrainer::Impl {
                         layer.size, layer.stride);
                 else if (layer.kind == Kind::l2norm)
                     l2norm_forward_kernel<<<1, threads>>>(source, destination, out_count);
+                else if (layer.kind == Kind::avgpool)
+                    avgpool_forward_kernel<<<layer.input.c, threads>>>(source, destination,
+                        layer.input.c, layer.input.h * layer.input.w);
                 else
                     softmax_vector<<<1, 1>>>(source, destination, out_count);
                 launch_check("CUDA classifier sequence forward");
@@ -597,6 +615,14 @@ struct CudaClassificationTrainer::Impl {
                     launch_check("CUDA classifier sequence l2norm backward");
                     continue;
                 }
+                if (layer.kind == Kind::avgpool) {
+                    if (reverse)
+                        avgpool_backward_kernel<<<(in_count + threads - 1) / threads, threads>>>(
+                            grad, derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count,
+                            layer.input.h * layer.input.w, in_count);
+                    launch_check("CUDA classifier sequence avgpool backward");
+                    continue;
+                }
                 activation_backward<<<(out_count + threads - 1) / threads, threads>>>(
                     grad, pre[reverse] + static_cast<std::size_t>(t) * out_count, out_count, layer.leaky);
                 launch_check("CUDA classifier sequence activation backward");
@@ -611,7 +637,7 @@ struct CudaClassificationTrainer::Impl {
                         layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
                 launch_check("CUDA classifier sequence input backward");
             }
-            if (layer.kind == Kind::maxpool || layer.kind == Kind::l2norm) continue;
+            if (layer.kind == Kind::maxpool || layer.kind == Kind::avgpool || layer.kind == Kind::l2norm) continue;
             if (layer.kind == Kind::connected)
                 dense_sequence_sgd<<<(in_count * out_count + threads - 1) / threads, threads>>>(
                     weights[reverse], biases[reverse], derivatives[reverse], previous,
@@ -639,7 +665,7 @@ struct CudaClassificationTrainer::Impl {
         auto& layers = network.layers_;
         for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
             auto& layer = layers[i];
-            if (layer.kind == Kind::maxpool || layer.kind == Kind::l2norm ||
+            if (layer.kind == Kind::maxpool || layer.kind == Kind::avgpool || layer.kind == Kind::l2norm ||
                 static_cast<int>(i) == recurrent_index) continue;
             check(cudaMemcpy(layer.weights.data(), weights[i],
                              layer.weights.size() * sizeof(float), cudaMemcpyDeviceToHost),

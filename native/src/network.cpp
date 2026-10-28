@@ -1,5 +1,6 @@
 #include "detector/network.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/avgpool.hpp"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -112,6 +113,8 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
     }
     case Kind::maxpool:
         return {shape.c, (shape.h - 1) / layer.stride + 1, (shape.w - 1) / layer.stride + 1};
+    case Kind::avgpool:
+        return {shape.c, 1, 1};
     case Kind::route: {
         // Branches are validated against each other, not against the incoming sequential `shape`:
         // a standalone passthrough route (e.g. Darknet's YOLOv2 `[route] layers=-9`, jumping back
@@ -264,6 +267,8 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
                             }
                         out[static_cast<std::size_t>(c) * out_plane + oy * layer.output.w + ox] = best;
                     }
+        } else if (layer.kind == Kind::avgpool) {
+            avgpool_forward(source.data(), out.data(), layer.input.c, layer.input.h * layer.input.w);
         } else if (layer.kind == Kind::route) {
             std::size_t offset = 0;
             for (int branch : layer.sources) {
@@ -356,6 +361,8 @@ Network Network::from_cfg(const std::string& path) {
             layer.size = integer(section, "size");
             layer.stride = integer(section, "stride");
             positive(layer.size, "size"); positive(layer.stride, "stride");
+        } else if (section.name == "avgpool" || section.name == "avg") {
+            layer.kind = Kind::avgpool;
         } else if (section.name == "route") {
             layer.kind = Kind::route;
             for (int raw : list(section, "layers")) {

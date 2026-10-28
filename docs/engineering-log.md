@@ -231,6 +231,13 @@ YOLO inference path.
   behavior, CPU/CUDA inference parity, detector minibatch parameter parity, and classifier SGD
   parity with and without an RNN sequence.
 
+**2026-10-27 — Global average-pooling layer.**
+- Added `[avgpool]` (and upstream's `[avg]` alias): each channel's spatial plane becomes one mean,
+  with gradients spread evenly back across the plane. CPU/CUDA inference, detector minibatches,
+  classifiers and RNN classifier chunks all use that contract.
+- Hand-computed two-channel means and input gradients pass; small detector and classifier graphs
+  verify CPU/CUDA forward and parameter-update parity, including an RNN sequence.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

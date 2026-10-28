@@ -346,6 +346,11 @@ int main() {
         check_parity((directory / "l2norm-train.cfg").string(), norm_input,
                      {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 2, "l2norm");
 
+        std::vector<float> average_input(detector::Network::from_cfg((directory / "avgpool-train.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < average_input.size(); ++i) average_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        check_parity((directory / "avgpool-train.cfg").string(), average_input,
+                     {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 2, "avgpool");
+
         check_dropout_runs((directory / "dropout-train.cfg").string(), {0.4f}, {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 20);
 
         // Region has no learnable parameters of its own and no randomness (rescore just decodes

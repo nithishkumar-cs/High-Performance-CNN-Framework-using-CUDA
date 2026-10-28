@@ -2,6 +2,7 @@
 #ifdef DETECTOR_HAS_CUDA
 #include "detector/yolo_loss.hpp"
 #include "l2norm_cuda.cuh"
+#include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
 #endif
@@ -550,11 +551,11 @@ struct CudaTrainer::Impl {
             if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru)
                 throw std::runtime_error("CUDA detector Trainer does not support rnn/lstm/gru layers; "
                                          "use CudaClassificationTrainer::train_sequence");
-            if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::route &&
+            if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::avgpool && layer.kind != Kind::route &&
                 layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo &&
                 layer.kind != Kind::dropout && layer.kind != Kind::reorg && layer.kind != Kind::region &&
                 layer.kind != Kind::l2norm)
-                throw std::runtime_error("CUDA detector training supports convolutional, maxpool, route, "
+                throw std::runtime_error("CUDA detector training supports convolutional, maxpool, avgpool, route, "
                                            "upsample, shortcut, yolo, region, dropout, reorg and l2norm layers only");
         }
         // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
@@ -790,6 +791,10 @@ struct CudaTrainer::Impl {
                         layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w, layer.size, layer.stride);
                     launch_check();
                 }
+            } else if (layer.kind == Kind::avgpool) {
+                avgpool_forward_kernel<<<static_cast<int>(n) * layer.input.c, kThreads>>>(
+                    previous_of(0), output[i], layer.input.c, layer.input.h * layer.input.w);
+                launch_check();
             } else if (layer.kind == Kind::route) {
                 for (std::size_t s = 0; s < n; ++s) {
                     std::size_t offset = 0;
@@ -925,6 +930,14 @@ struct CudaTrainer::Impl {
                             prev_grad_of(s), elements);
                         launch_check();
                     }
+            } else if (layer.kind == Kind::avgpool) {
+                if (reverse) {
+                    const int spatial = layer.input.h * layer.input.w;
+                    const int count = static_cast<int>(n * layer.input.elements());
+                    avgpool_backward_kernel<<<blocks_for(count), kThreads>>>(
+                        gradient[reverse], prev_grad_of(0), spatial, count);
+                    launch_check();
+                }
             } else if (layer.kind == Kind::dropout) {
                 if (reverse)
                     for (std::size_t s = 0; s < n; ++s) {

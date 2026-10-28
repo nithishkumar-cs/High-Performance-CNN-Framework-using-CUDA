@@ -83,6 +83,7 @@ const char* kind_name(detector::Kind kind) {
     switch (kind) {
     case detector::Kind::convolutional: return "conv";
     case detector::Kind::maxpool: return "maxpool";
+    case detector::Kind::avgpool: return "avgpool";
     case detector::Kind::route: return "route";
     case detector::Kind::upsample: return "upsample";
     case detector::Kind::yolo: return "yolo";

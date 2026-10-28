@@ -1,5 +1,6 @@
 #include "detector/trainer.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/avgpool.hpp"
 #include "detector/yolo_loss.hpp"
 #include <algorithm>
 #include <cmath>
@@ -248,6 +249,10 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                             result[static_cast<std::size_t>(c) * out_plane + oy * layer.output.w + ox] = best;
                         }
             }
+        } else if (layer.kind == Kind::avgpool) {
+            const int spatial = layer.input.h * layer.input.w;
+            for (std::size_t s = 0; s < n; ++s)
+                avgpool_forward(previous_of(s).data(), output[s][index].data(), layer.input.c, spatial);
         } else if (layer.kind == Kind::route) {
             for (std::size_t s = 0; s < n; ++s) {
                 auto& result = output[s][index];
@@ -391,6 +396,12 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                             gradient[s][reverse - 1][best_pos] += grad[static_cast<std::size_t>(c) * out_plane + oy * layer.output.w + ox];
                         }
             }
+        } else if (layer.kind == Kind::avgpool) {
+            if (!reverse) continue;
+            const int spatial = layer.input.h * layer.input.w;
+            for (std::size_t s = 0; s < n; ++s)
+                avgpool_backward(gradient[s][reverse].data(), gradient[s][reverse - 1].data(),
+                                 layer.input.c, spatial);
         } else if (layer.kind == Kind::dropout) {
             if (!reverse) continue;
             for (std::size_t s = 0; s < n; ++s) {

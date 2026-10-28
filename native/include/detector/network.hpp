@@ -18,7 +18,7 @@ struct Shape {
     std::size_t elements() const;
 };
 
-enum class Kind { convolutional, maxpool, avgpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region, rnn, lstm, gru, l2norm };
+enum class Kind { convolutional, maxpool, avgpool, route, upsample, yolo, connected, softmax, shortcut, dropout, reorg, region, rnn, lstm, gru, l2norm, normalization, local, deconvolutional };
 enum class Backend { cpu, cuda, tensorrt };
 
 struct Layer {
@@ -32,13 +32,17 @@ struct Layer {
     int padding = 0;
     bool batch_normalize = false;
     bool leaky = false;
+    bool logistic = false;  // local and deconvolutional cfg default to logistic activation.
     int classes = 0;
     float ignore_thresh = 1.0f;  // yolo layers only: skip objectness-negative loss for predicted
                                   // boxes overlapping any ground truth by at least this IoU (Darknet's
                                   // near-miss "ignore" rule); 1.0 (unreachable) disables it.
     float dropout_probability = 0.5f;  // dropout layers only: fraction of activations zeroed during
-                                        // training (inverted dropout - kept activations scaled by
-                                        // 1/(1-p)); a no-op at inference, matching Darknet.
+                                         // training (inverted dropout - kept activations scaled by
+                                         // 1/(1-p)); a no-op at inference, matching Darknet.
+    float norm_alpha = 0.0001f;
+    float norm_beta = 0.75f;
+    float norm_kappa = 1.0f;
     // region layers only (YOLOv2-style head: all `anchors` apply to every cell, no mask subset -
     // `mask` is populated as the identity [0..anchors.size()) at parse time so the shared
     // yolo/region assignment and decode code can treat both kinds uniformly). `rescore` makes the

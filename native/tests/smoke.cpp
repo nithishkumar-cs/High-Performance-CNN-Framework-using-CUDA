@@ -1,5 +1,9 @@
 #include "detector/image.hpp"
+#include "detector/deconvolutional.hpp"
+#include "detector/local.hpp"
 #include "detector/network.hpp"
+#include "detector/normalization.hpp"
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -95,6 +99,162 @@ int main() {
         float average_expected = std::exp(5.0f) / (std::exp(2.5f) + std::exp(5.0f));
         expect(std::abs(average_cpu[0].values[1] - average_expected) < 1e-6f,
                "global avgpool channel means");
+        auto response_net = detector::Network::from_cfg(
+            (std::filesystem::path(__FILE__).parent_path() / "normalization.cfg").string());
+        const std::vector<float> response_input{1.0f, 2.0f, 3.0f, 4.0f};
+        const float expected_response[4] = {1.0f / 2.5f, 2.0f / 3.4f, 3.0f / 4.9f, 4.0f / 4.5f};
+        auto response_cpu = response_net.forward(response_input, detector::Backend::cpu);
+        float response_sum = 0.0f;
+        for (float value : expected_response) response_sum += std::exp(value);
+        for (int i = 0; i < 4; ++i)
+            expect(std::abs(response_cpu[0].values[static_cast<std::size_t>(i)] -
+                std::exp(expected_response[i]) / response_sum) < 1e-6f,
+                "normalization channel window");
+        const float response_upstream[4] = {0.3f, -0.7f, 1.1f, 0.4f};
+        float response_output[4], response_norms[4], response_gradient[4] = {};
+        detector::normalization_forward(response_input.data(), response_output, response_norms,
+            4, 1, 3, 0.1f, 1.0f, 2.0f);
+        detector::normalization_backward(response_input.data(), response_output, response_norms,
+            response_upstream, response_gradient, 4, 1, 3, 0.1f, 1.0f);
+        for (int i = 0; i < 4; ++i) {
+            auto perturbed = response_input;
+            perturbed[static_cast<std::size_t>(i)] += 1e-3f;
+            float plus[4];
+            detector::normalization_forward(perturbed.data(), plus, nullptr, 4, 1, 3, 0.1f, 1.0f, 2.0f);
+            perturbed[static_cast<std::size_t>(i)] -= 2e-3f;
+            float minus[4];
+            detector::normalization_forward(perturbed.data(), minus, nullptr, 4, 1, 3, 0.1f, 1.0f, 2.0f);
+            float numeric = 0.0f;
+            for (int j = 0; j < 4; ++j)
+                numeric += response_upstream[j] * (plus[j] - minus[j]) / 2e-3f;
+            expect(std::abs(numeric - response_gradient[i]) < 1e-4f,
+                   "normalization input gradient");
+        }
+        auto local_net = detector::Network::from_cfg(
+            (std::filesystem::path(__FILE__).parent_path() / "local.cfg").string());
+        local_net.initialize_random(5);
+        auto& local_layer = local_net.layer(0);
+        expect(local_layer.weights.size() == 4 && local_layer.biases.size() == 4,
+               "local layer keeps one filter and bias per output location");
+        local_layer.weights = {2.0f, -1.0f, 0.5f, 3.0f};
+        local_layer.biases = {0.5f, 0.0f, -1.0f, 0.25f};
+        auto& local_dense = local_net.layer(1);
+        std::fill(local_dense.weights.begin(), local_dense.weights.end(), 0.0f);
+        std::fill(local_dense.biases.begin(), local_dense.biases.end(), 0.0f);
+        for (int i = 0; i < 4; ++i) local_dense.weights[static_cast<std::size_t>(i * 4 + i)] = 1.0f;
+        const std::vector<float> local_input{1.0f, 2.0f, 3.0f, 4.0f};
+        const float local_logits[4] = {2.5f, -2.0f, 0.5f, 12.25f};
+        float local_exp = 0.0f;
+        for (float logit : local_logits) local_exp += std::exp(logit);
+        auto local_cpu = local_net.forward(local_input, detector::Backend::cpu);
+        for (int i = 0; i < 4; ++i)
+            expect(std::abs(local_cpu[0].values[static_cast<std::size_t>(i)] -
+                            std::exp(local_logits[i]) / local_exp) < 1e-6f, "local unshared weights");
+#ifdef DETECTOR_HAS_CUDA
+        auto local_gpu = local_net.forward(local_input, detector::Backend::cuda);
+        for (int i = 0; i < 4; ++i)
+            expect(std::abs(local_gpu[0].values[static_cast<std::size_t>(i)] -
+                            local_cpu[0].values[static_cast<std::size_t>(i)]) < 1e-5f,
+                   "local CPU/CUDA parity");
+#endif
+        {
+            detector::Layer probe;
+            probe.kind = detector::Kind::local;
+            probe.input = {2, 3, 3}; probe.output = {2, 2, 2};
+            probe.filters = 2; probe.size = 2; probe.stride = 1; probe.padding = 0;
+            probe.logistic = true;
+            probe.weights.resize(4 * 2 * 2 * 2 * 2); probe.biases.resize(8);
+            for (std::size_t i = 0; i < probe.weights.size(); ++i)
+                probe.weights[i] = 0.3f * std::sin(0.7f * static_cast<float>(i));
+            for (std::size_t i = 0; i < probe.biases.size(); ++i)
+                probe.biases[i] = 0.1f * static_cast<float>(i) - 0.3f;
+            std::vector<float> x(18), up{0.3f, -0.7f, 1.1f, 0.4f, -0.2f, 0.9f, 0.5f, -1.0f};
+            for (std::size_t i = 0; i < x.size(); ++i) x[i] = std::cos(0.9f * static_cast<float>(i));
+            auto loss = [&](const detector::Layer& layer, const std::vector<float>& in) {
+                std::vector<float> out(8);
+                detector::local_forward(layer, in.data(), out.data());
+                float total = 0.0f;
+                for (int i = 0; i < 8; ++i) total += up[static_cast<std::size_t>(i)] * out[static_cast<std::size_t>(i)];
+                return total;
+            };
+            std::vector<float> out(8), gx(18), gw(probe.weights.size()), gb(8);
+            detector::local_forward(probe, x.data(), out.data());
+            detector::local_backward(probe, x.data(), out.data(), up.data(), gx.data(), gw.data(), gb.data());
+            const float eps = 1e-3f;
+            for (std::size_t i = 0; i < x.size(); ++i) {
+                auto hi = x, lo = x; hi[i] += eps; lo[i] -= eps;
+                expect(std::abs((loss(probe, hi) - loss(probe, lo)) / (2 * eps) - gx[i]) < 2e-3f,
+                       "local input gradient");
+            }
+            for (std::size_t i = 0; i < probe.weights.size(); ++i) {
+                auto hi = probe, lo = probe; hi.weights[i] += eps; lo.weights[i] -= eps;
+                expect(std::abs((loss(hi, x) - loss(lo, x)) / (2 * eps) - gw[i]) < 2e-3f,
+                       "local weight gradient");
+            }
+            for (std::size_t i = 0; i < probe.biases.size(); ++i) {
+                auto hi = probe, lo = probe; hi.biases[i] += eps; lo.biases[i] -= eps;
+                expect(std::abs((loss(hi, x) - loss(lo, x)) / (2 * eps) - gb[i]) < 2e-3f,
+                       "local bias gradient");
+            }
+        }
+        {
+            detector::Layer probe;
+            probe.kind = detector::Kind::deconvolutional;
+            probe.input = {1, 2, 2}; probe.output = {1, 3, 3};
+            probe.filters = 1; probe.size = 2; probe.stride = 1; probe.padding = 0;
+            probe.weights = {1.0f, 10.0f, 100.0f, 1000.0f};
+            probe.biases = {0.5f};
+            const std::vector<float> x{1.0f, 2.0f, 3.0f, 4.0f};
+            const float expected[9] = {1, 12, 20, 103, 1234, 2040, 300, 3400, 4000};
+            std::vector<float> out(9);
+            detector::deconvolutional_forward(probe, x.data(), out.data());
+            for (int i = 0; i < 9; ++i) expect(std::abs(out[static_cast<std::size_t>(i)] - expected[i] - 0.5f) < 1e-3f,
+                                               "deconvolutional transposed-convolution output");
+            auto strided = detector::Network::from_cfg(
+                (std::filesystem::path(__FILE__).parent_path() / "deconv-train.cfg").string());
+            expect(strided.layers()[0].output.h == 3 && strided.layers()[1].output.h == 4,
+                   "deconvolutional output shape");
+
+            probe.stride = 2; probe.padding = 1; probe.input = {1, 2, 2}; probe.output = {1, 2, 2};
+            probe.logistic = true; probe.size = 2;
+            probe.biases = {0.1f};
+            probe.weights = {0.3f, -0.5f, 0.7f, 0.2f};
+            const std::vector<float> up{0.3f, -0.7f, 1.1f, 0.4f};
+            auto loss = [&](const detector::Layer& layer, const std::vector<float>& in) {
+                std::vector<float> o(4);
+                detector::deconvolutional_forward(layer, in.data(), o.data());
+                float total = 0.0f;
+                for (int i = 0; i < 4; ++i) total += up[static_cast<std::size_t>(i)] * o[static_cast<std::size_t>(i)];
+                return total;
+            };
+            std::vector<float> o(4), gx(4), gw(4), gb(1);
+            detector::deconvolutional_forward(probe, x.data(), o.data());
+            detector::deconvolutional_backward(probe, x.data(), o.data(), up.data(), gx.data(), gw.data(), gb.data());
+            const float eps = 1e-3f;
+            for (std::size_t i = 0; i < 4; ++i) {
+                auto hi = x, lo = x; hi[i] += eps; lo[i] -= eps;
+                expect(std::abs((loss(probe, hi) - loss(probe, lo)) / (2 * eps) - gx[i]) < 2e-3f,
+                       "deconvolutional input gradient");
+                auto wh = probe, wl = probe; wh.weights[i] += eps; wl.weights[i] -= eps;
+                expect(std::abs((loss(wh, x) - loss(wl, x)) / (2 * eps) - gw[i]) < 2e-3f,
+                       "deconvolutional weight gradient");
+            }
+            auto parity = detector::Network::from_cfg(
+                (std::filesystem::path(__FILE__).parent_path() / "deconv-classifier.cfg").string());
+            parity.initialize_random(9);
+            std::vector<float> parity_input(parity.input_shape().elements());
+            for (std::size_t i = 0; i < parity_input.size(); ++i) parity_input[i] = 0.2f * static_cast<float>(i % 5) - 0.3f;
+            auto parity_cpu = parity.forward(parity_input, detector::Backend::cpu);
+#ifdef DETECTOR_HAS_CUDA
+            auto parity_gpu = parity.forward(parity_input, detector::Backend::cuda);
+            for (std::size_t i = 0; i < parity_cpu[0].values.size(); ++i)
+                expect(std::abs(parity_gpu[0].values[i] - parity_cpu[0].values[i]) < 1e-5f,
+                       "deconvolutional CPU/CUDA parity");
+#endif
+            auto bh = probe, bl = probe; bh.biases[0] += eps; bl.biases[0] -= eps;
+            expect(std::abs((loss(bh, x) - loss(bl, x)) / (2 * eps) - gb[0]) < 2e-3f,
+                   "deconvolutional bias gradient");
+        }
         std::vector<detector::Detection> duplicates = {
             {0, 0.9f, 0, 0, 2, 2}, {0, 0.8f, 0, 0, 2, 2}, {1, 0.7f, 0, 0, 2, 2}
         };
@@ -119,7 +279,11 @@ int main() {
             auto average_gpu = average_net.forward(average_input, detector::Backend::cuda);
             for (std::size_t i = 0; i < average_cpu[0].values.size(); ++i)
                 expect(std::abs(average_gpu[0].values[i] - average_cpu[0].values[i]) < 1e-5f,
-                       "global avgpool CPU/CUDA parity");
+                        "global avgpool CPU/CUDA parity");
+            auto response_gpu = response_net.forward(response_input, detector::Backend::cuda);
+            for (std::size_t i = 0; i < response_cpu[0].values.size(); ++i)
+                expect(std::abs(response_gpu[0].values[i] - response_cpu[0].values[i]) < 1e-5f,
+                       "normalization CPU/CUDA parity");
         }
 #endif
 

@@ -1,6 +1,9 @@
 #include "detector/cuda_session.hpp"
 #include "detector/cuda_recurrent.hpp"
 #include "l2norm_cuda.cuh"
+#include "normalization_cuda.cuh"
+#include "local_cuda.cuh"
+#include "deconv_cuda.cuh"
 #include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
@@ -174,9 +177,19 @@ struct CudaSession::Impl {
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
             output[i] = memory.floats(layer.output.elements());
-            if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
-            if (layer.biases.size() != static_cast<std::size_t>(layer.filters) || layer.weights.empty())
+            if (layer.kind != Kind::convolutional && layer.kind != Kind::connected &&
+                layer.kind != Kind::local && layer.kind != Kind::deconvolutional) continue;
+            if (layer.biases.size() != (layer.kind == Kind::local ? layer.output.elements() :
+                static_cast<std::size_t>(layer.filters)) || layer.weights.empty())
                 throw std::runtime_error("load weights before constructing CudaSession");
+            if (layer.kind == Kind::deconvolutional) {
+                parameters[i] = {memory.upload(layer.weights), nullptr, memory.upload(layer.biases)};
+                continue;
+            }
+            if (layer.kind == Kind::local) {
+                parameters[i] = {memory.upload(layer.weights), nullptr, memory.upload(layer.biases)};
+                continue;
+            }
             std::vector<float> multiplier(static_cast<std::size_t>(layer.filters), 1.0f);
             std::vector<float> offsets = layer.biases;
             if (layer.kind == Kind::convolutional && layer.batch_normalize)
@@ -207,7 +220,21 @@ struct CudaSession::Impl {
             float* result = output[index];
             int elements = static_cast<int>(layer.output.elements());
             int blocks = (elements + threads - 1) / threads;
-            if (layer.kind == Kind::convolutional) {
+            if (layer.kind == Kind::deconvolutional) {
+                const auto& param = parameters[index];
+                deconv_forward_kernel<<<blocks, threads>>>(previous, param.weights, param.offsets,
+                    result, elements, layer.input.c, layer.input.h, layer.input.w, layer.filters,
+                    layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding,
+                    layer.leaky, layer.logistic);
+                launch_check();
+            } else if (layer.kind == Kind::local) {
+                const auto& param = parameters[index];
+                local_forward_kernel<<<blocks, threads>>>(previous, param.weights, param.offsets,
+                    result, elements, layer.input.c, layer.input.h, layer.input.w, layer.filters,
+                    layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding,
+                    layer.leaky, layer.logistic);
+                launch_check();
+            } else if (layer.kind == Kind::convolutional) {
                 const auto& param = parameters[index];
 #ifdef DETECTOR_HAS_CUDNN
                 cudnn_convolutions[index]->forward(previous, param.weights, result);
@@ -253,6 +280,11 @@ struct CudaSession::Impl {
                       "cudaMemcpy dropout");  // no-op at inference, matching Darknet
             } else if (layer.kind == Kind::l2norm) {
                 l2norm_forward_kernel<<<1, threads>>>(previous, result, elements);
+                launch_check();
+            } else if (layer.kind == Kind::normalization) {
+                normalization_forward_kernel<<<blocks, threads>>>(previous, result, nullptr, elements,
+                    layer.input.c, layer.input.h * layer.input.w, layer.size,
+                    layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
                 launch_check();
             } else if (layer.kind == Kind::reorg) {
                 reorg<<<blocks, threads>>>(previous, result, layer.input.c, layer.input.h, layer.input.w, layer.stride);

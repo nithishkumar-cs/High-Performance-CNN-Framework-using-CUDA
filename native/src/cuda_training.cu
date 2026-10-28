@@ -2,6 +2,9 @@
 #ifdef DETECTOR_HAS_CUDA
 #include "detector/yolo_loss.hpp"
 #include "l2norm_cuda.cuh"
+#include "normalization_cuda.cuh"
+#include "local_cuda.cuh"
+#include "deconv_cuda.cuh"
 #include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDNN
 #include "detector/cudnn_backend.hpp"
@@ -554,9 +557,9 @@ struct CudaTrainer::Impl {
             if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::avgpool && layer.kind != Kind::route &&
                 layer.kind != Kind::upsample && layer.kind != Kind::shortcut && layer.kind != Kind::yolo &&
                 layer.kind != Kind::dropout && layer.kind != Kind::reorg && layer.kind != Kind::region &&
-                layer.kind != Kind::l2norm)
-                throw std::runtime_error("CUDA detector training supports convolutional, maxpool, avgpool, route, "
-                                           "upsample, shortcut, yolo, region, dropout, reorg and l2norm layers only");
+                layer.kind != Kind::l2norm && layer.kind != Kind::normalization && layer.kind != Kind::local &&
+                layer.kind != Kind::deconvolutional)
+                throw std::runtime_error("unsupported layer in CUDA detector trainer");
         }
         // input/output/preactivation/gradient/raw/max_index are sized for `batch` sample blocks
         // laid out contiguously (sample-major) so a true minibatch's cross-sample batch-norm
@@ -588,6 +591,36 @@ struct CudaTrainer::Impl {
             // per-step 0/keep_scale draw, so backward replays the exact mask forward drew.
             if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout) {
                 preactivation[i] = memory.floats(batch_elems * layer.output.elements());
+                continue;
+            }
+            if (layer.kind == Kind::normalization) {
+                preactivation[i] = memory.floats(batch_elems * layer.output.elements());
+                continue;
+            }
+            if (layer.kind == Kind::deconvolutional) {
+                if (layer.weights.size() != static_cast<std::size_t>(layer.filters) * layer.input.c *
+                        layer.size * layer.size ||
+                    layer.biases.size() != static_cast<std::size_t>(layer.filters))
+                    throw std::runtime_error("initialize or load deconvolutional weights before CUDA training");
+                weights[i] = memory.upload(layer.weights);
+                biases[i] = memory.upload(layer.biases);
+                weight_grad_accum[i] = memory.floats(layer.weights.size());
+                bias_grad_accum[i] = memory.floats(layer.biases.size());
+                weight_velocity[i] = memory.floats(layer.weights.size());
+                bias_velocity[i] = memory.floats(layer.biases.size());
+                continue;
+            }
+            if (layer.kind == Kind::local) {
+                const std::size_t locations = static_cast<std::size_t>(layer.output.h) * layer.output.w;
+                if (layer.weights.size() != locations * layer.filters * layer.input.c * layer.size * layer.size ||
+                    layer.biases.size() != layer.output.elements())
+                    throw std::runtime_error("initialize or load local weights before CUDA training");
+                weights[i] = memory.upload(layer.weights);
+                biases[i] = memory.upload(layer.biases);
+                weight_grad_accum[i] = memory.floats(layer.weights.size());
+                bias_grad_accum[i] = memory.floats(layer.biases.size());
+                weight_velocity[i] = memory.floats(layer.weights.size());
+                bias_velocity[i] = memory.floats(layer.biases.size());
                 continue;
             }
             if (layer.kind != Kind::convolutional) continue;
@@ -669,7 +702,8 @@ struct CudaTrainer::Impl {
             memory.replace(output[i], elems);
             memory.replace(gradient[i], elems);
             if (layer.kind == Kind::maxpool) { memory.replace(max_index[i], elems); continue; }
-            if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout) { memory.replace(preactivation[i], elems); continue; }
+            if (layer.kind == Kind::shortcut || layer.kind == Kind::dropout ||
+                layer.kind == Kind::normalization) { memory.replace(preactivation[i], elems); continue; }
             if (layer.kind != Kind::convolutional) continue;
 #ifdef DETECTOR_HAS_CUDNN
             cudnn_convolutions[i] = std::make_unique<CudnnConvolution>(layer.input.c, layer.input.h,
@@ -829,8 +863,26 @@ struct CudaTrainer::Impl {
                         preactivation[i] + s * elems, elements, layer.dropout_probability, keep_scale, seed);
                     launch_check();
                 }
+            } else if (layer.kind == Kind::deconvolutional) {
+                deconv_forward_kernel<<<blocks_for(static_cast<int>(n) * elements), kThreads>>>(
+                    previous_of(0), weights[i], biases[i], output[i], static_cast<int>(n) * elements,
+                    layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                    layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky, layer.logistic);
+                launch_check();
+            } else if (layer.kind == Kind::local) {
+                local_forward_kernel<<<blocks_for(static_cast<int>(n) * elements), kThreads>>>(
+                    previous_of(0), weights[i], biases[i], output[i], static_cast<int>(n) * elements,
+                    layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                    layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky, layer.logistic);
+                launch_check();
             } else if (layer.kind == Kind::l2norm) {
                 l2norm_forward_kernel<<<static_cast<int>(n), kThreads>>>(previous_of(0), output[i], elements);
+                launch_check();
+            } else if (layer.kind == Kind::normalization) {
+                normalization_forward_kernel<<<blocks_for(static_cast<int>(n) * elements), kThreads>>>(
+                    previous_of(0), output[i], preactivation[i], static_cast<int>(n) * elements,
+                    layer.input.c, layer.input.h * layer.input.w, layer.size,
+                    layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
                 launch_check();
             } else if (layer.kind == Kind::reorg) {
                 for (std::size_t s = 0; s < n; ++s) {
@@ -945,10 +997,63 @@ struct CudaTrainer::Impl {
                             preactivation[reverse] + s * elems, prev_grad_of(s), elements);
                         launch_check();
                     }
+            } else if (layer.kind == Kind::deconvolutional) {
+                const int total = static_cast<int>(n) * elements;
+                deconv_activation_backward_kernel<<<blocks_for(total), kThreads>>>(
+                    output[reverse], gradient[reverse], total, layer.leaky, layer.logistic);
+                launch_check();
+                deconv_weight_gradient_kernel<<<blocks_for(static_cast<int>(layer.weights.size())), kThreads>>>(
+                    previous_of(0), gradient[reverse], weight_grad_accum[reverse],
+                    static_cast<int>(layer.weights.size()), static_cast<int>(n), layer.input.c,
+                    layer.input.h, layer.input.w, layer.filters, layer.output.h, layer.output.w,
+                    layer.size, layer.stride, layer.padding);
+                launch_check();
+                deconv_bias_gradient_kernel<<<blocks_for(layer.filters), kThreads>>>(
+                    gradient[reverse], bias_grad_accum[reverse], layer.filters,
+                    layer.output.h * layer.output.w, static_cast<int>(n));
+                launch_check();
+                if (reverse) {
+                    deconv_backward_input_kernel<<<blocks_for(static_cast<int>(n * layer.input.elements())), kThreads>>>(
+                        gradient[reverse], weights[reverse], prev_grad_of(0),
+                        static_cast<int>(n * layer.input.elements()), layer.input.c, layer.input.h,
+                        layer.input.w, layer.filters, layer.output.h, layer.output.w, layer.size,
+                        layer.stride, layer.padding);
+                    launch_check();
+                }
+            } else if (layer.kind == Kind::local) {
+                const int total = static_cast<int>(n) * elements;
+                local_activation_backward_kernel<<<blocks_for(total), kThreads>>>(
+                    output[reverse], gradient[reverse], total, layer.leaky, layer.logistic);
+                launch_check();
+                local_weight_gradient_kernel<<<blocks_for(static_cast<int>(layer.weights.size())), kThreads>>>(
+                    previous_of(0), gradient[reverse], weight_grad_accum[reverse],
+                    static_cast<int>(layer.weights.size()), static_cast<int>(n), layer.input.c,
+                    layer.input.h, layer.input.w, layer.filters, layer.output.h, layer.output.w,
+                    layer.size, layer.stride, layer.padding);
+                launch_check();
+                local_bias_gradient_kernel<<<blocks_for(elements), kThreads>>>(
+                    gradient[reverse], bias_grad_accum[reverse], elements, static_cast<int>(n));
+                launch_check();
+                if (reverse) {
+                    local_backward_input_kernel<<<blocks_for(static_cast<int>(n * layer.input.elements())), kThreads>>>(
+                        gradient[reverse], weights[reverse], prev_grad_of(0),
+                        static_cast<int>(n * layer.input.elements()), layer.input.c, layer.input.h,
+                        layer.input.w, layer.filters, layer.output.h, layer.output.w, layer.size,
+                        layer.stride, layer.padding);
+                    launch_check();
+                }
             } else if (layer.kind == Kind::l2norm) {
                 if (reverse) {
                     l2norm_backward_kernel<<<static_cast<int>(n), kThreads>>>(previous_of(0),
                         output[reverse], gradient[reverse], prev_grad_of(0), elements);
+                    launch_check();
+                }
+            } else if (layer.kind == Kind::normalization) {
+                if (reverse) {
+                    normalization_backward_kernel<<<blocks_for(static_cast<int>(n) * elements), kThreads>>>(
+                        previous_of(0), output[reverse], preactivation[reverse], gradient[reverse],
+                        prev_grad_of(0), static_cast<int>(n) * elements, layer.input.c,
+                        layer.input.h * layer.input.w, layer.size, layer.norm_alpha, layer.norm_beta);
                     launch_check();
                 }
             } else if (layer.kind == Kind::reorg) {
@@ -1034,6 +1139,21 @@ struct CudaTrainer::Impl {
         float inv_n = 1.0f / static_cast<float>(n);
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
+            if (layer.kind == Kind::local || layer.kind == Kind::deconvolutional) {
+                const int wc = static_cast<int>(layer.weights.size());
+                const int bc = static_cast<int>(layer.biases.size());
+                sgd_apply_with_decay_momentum<<<blocks_for(wc), kThreads>>>(
+                    weights[i], weight_grad_accum[i], weight_velocity[i], wc, lr, inv_n, weight_decay, momentum);
+                launch_check();
+                sgd_apply_momentum<<<blocks_for(bc), kThreads>>>(
+                    biases[i], bias_grad_accum[i], bias_velocity[i], bc, lr, inv_n, momentum);
+                launch_check();
+                zero<<<blocks_for(wc), kThreads>>>(weight_grad_accum[i], wc);
+                launch_check();
+                zero<<<blocks_for(bc), kThreads>>>(bias_grad_accum[i], bc);
+                launch_check();
+                continue;
+            }
             if (layer.kind != Kind::convolutional) continue;
             int wcount = static_cast<int>(layer.weights.size());
             sgd_apply_with_decay_momentum<<<blocks_for(wcount), kThreads>>>(
@@ -1068,7 +1188,8 @@ struct CudaTrainer::Impl {
         const auto& layers = network.layers();
         for (std::size_t i = 0; i < layers.size(); ++i) {
             const auto& layer = layers[i];
-            if (layer.kind != Kind::convolutional) continue;
+            if (layer.kind != Kind::convolutional && layer.kind != Kind::local &&
+                layer.kind != Kind::deconvolutional) continue;
             result.emplace_back(weights[i], layer.weights.size());
             result.emplace_back(biases[i], layer.biases.size());
             result.emplace_back(weight_velocity[i], layer.weights.size());
@@ -1086,7 +1207,8 @@ struct CudaTrainer::Impl {
     void sync_to_network() {
         const auto& layers = network.layers();
         for (std::size_t i = 0; i < layers.size(); ++i) {
-            if (layers[i].kind != Kind::convolutional) continue;
+            if (layers[i].kind != Kind::convolutional && layers[i].kind != Kind::local &&
+                layers[i].kind != Kind::deconvolutional) continue;
             auto& layer = network.layer(i);
             check(cudaMemcpy(layer.weights.data(), weights[i], layer.weights.size() * sizeof(float), cudaMemcpyDeviceToHost),
                   "cudaMemcpy learned weights");

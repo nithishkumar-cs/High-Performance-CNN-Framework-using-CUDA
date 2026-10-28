@@ -1,5 +1,8 @@
 #include "detector/classifier_trainer.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/normalization.hpp"
+#include "detector/local.hpp"
+#include "detector/deconvolutional.hpp"
 #include "detector/avgpool.hpp"
 #include <algorithm>
 #include <cmath>
@@ -21,10 +24,11 @@ ClassificationTrainer::ClassificationTrainer(Network& network, float learning_ra
     int recurrent_count = 0;
     for (const auto& layer : layers) {
         if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) { ++recurrent_count; continue; }
-        if (layer.kind != Kind::convolutional && layer.kind != Kind::maxpool && layer.kind != Kind::avgpool &&
-            layer.kind != Kind::connected && layer.kind != Kind::softmax && layer.kind != Kind::l2norm)
-            throw std::runtime_error("classifier trainer supports convolutional, maxpool, avgpool, connected, softmax, "
-                                      "l2norm, and (via train_sequence()) one rnn/lstm/gru layer");
+        if (layer.kind != Kind::convolutional && layer.kind != Kind::local &&
+            layer.kind != Kind::deconvolutional && layer.kind != Kind::maxpool && layer.kind != Kind::avgpool &&
+            layer.kind != Kind::connected && layer.kind != Kind::softmax && layer.kind != Kind::l2norm &&
+            layer.kind != Kind::normalization)
+            throw std::runtime_error("unsupported layer in classifier trainer");
     }
     if (recurrent_count > 1) throw std::runtime_error("classifier trainer supports at most one rnn/lstm/gru layer");
 }
@@ -85,6 +89,18 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
                         result[pos] = layer.leaky && value < 0 ? value * 0.1f : value;
                     }
             }
+        } else if (layer.kind == Kind::local) {
+            if (layer.biases.size() != result.size() ||
+                layer.weights.size() != result.size() *
+                    static_cast<std::size_t>(layer.input.c) * layer.size * layer.size)
+                throw std::runtime_error("initialize or load local classifier weights before training");
+            local_forward(layer, previous.data(), result.data());
+        } else if (layer.kind == Kind::deconvolutional) {
+            if (layer.biases.size() != static_cast<std::size_t>(layer.filters) ||
+                layer.weights.size() != static_cast<std::size_t>(layer.filters) *
+                    layer.input.c * layer.size * layer.size)
+                throw std::runtime_error("initialize or load deconvolutional classifier weights before training");
+            deconvolutional_forward(layer, previous.data(), result.data());
         } else if (layer.kind == Kind::maxpool) {
             max_index[index].resize(result.size());
             const int pad = (layer.size - 1) / 2;
@@ -127,6 +143,12 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
             }
         } else if (layer.kind == Kind::l2norm) {
             preactivation[index] = {l2norm_forward(previous.data(), result.data(), result.size())};
+        } else if (layer.kind == Kind::normalization) {
+            auto& norms = preactivation[index];
+            norms.resize(result.size());
+            normalization_forward(previous.data(), result.data(), norms.data(), layer.input.c,
+                layer.input.h * layer.input.w, layer.size, layer.norm_alpha, layer.norm_beta,
+                layer.norm_kappa);
         } else {
             float maximum = *std::max_element(previous.begin(), previous.end());
             float total = 0.0f;
@@ -166,6 +188,32 @@ ClassificationResult ClassificationTrainer::step(const std::vector<float>& input
             if (reverse)
                 l2norm_backward(output[reverse].data(), grad.data(), gradient[reverse - 1].data(),
                                 grad.size(), preactivation[reverse][0]);
+        } else if (layer.kind == Kind::normalization) {
+            if (reverse)
+                normalization_backward(previous.data(), output[reverse].data(),
+                    preactivation[reverse].data(), grad.data(), gradient[reverse - 1].data(),
+                    layer.input.c, layer.input.h * layer.input.w, layer.size,
+                    layer.norm_alpha, layer.norm_beta);
+        } else if (layer.kind == Kind::local) {
+            std::vector<float> weight_grad(layer.weights.size(), 0.0f);
+            std::vector<float> bias_grad(layer.biases.size(), 0.0f);
+            local_backward(layer, previous.data(), output[reverse].data(), grad.data(),
+                reverse ? gradient[reverse - 1].data() : nullptr,
+                weight_grad.data(), bias_grad.data());
+            for (std::size_t j = 0; j < layer.weights.size(); ++j)
+                layer.weights[j] -= learning_rate_ * (weight_grad[j] + weight_decay_ * layer.weights[j]);
+            for (std::size_t j = 0; j < layer.biases.size(); ++j)
+                layer.biases[j] -= learning_rate_ * bias_grad[j];
+        } else if (layer.kind == Kind::deconvolutional) {
+            std::vector<float> weight_grad(layer.weights.size(), 0.0f);
+            std::vector<float> bias_grad(layer.biases.size(), 0.0f);
+            deconvolutional_backward(layer, previous.data(), output[reverse].data(), grad.data(),
+                reverse ? gradient[reverse - 1].data() : nullptr,
+                weight_grad.data(), bias_grad.data());
+            for (std::size_t j = 0; j < layer.weights.size(); ++j)
+                layer.weights[j] -= learning_rate_ * (weight_grad[j] + weight_decay_ * layer.weights[j]);
+            for (std::size_t j = 0; j < layer.biases.size(); ++j)
+                layer.biases[j] -= learning_rate_ * bias_grad[j];
         } else if (layer.kind == Kind::connected) {
             std::vector<float> weight_grad(layer.weights.size(), 0.0f);
             std::vector<float> bias_grad(layer.biases.size(), 0.0f);
@@ -297,6 +345,18 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                             result[pos] = layer.leaky && value < 0 ? value * 0.1f : value;
                         }
                 }
+            } else if (layer.kind == Kind::local) {
+                if (layer.biases.size() != result.size() ||
+                    layer.weights.size() != result.size() *
+                        static_cast<std::size_t>(layer.input.c) * layer.size * layer.size)
+                    throw std::runtime_error("initialize or load local classifier weights before training");
+                local_forward(layer, previous.data(), result.data());
+            } else if (layer.kind == Kind::deconvolutional) {
+                if (layer.biases.size() != static_cast<std::size_t>(layer.filters) ||
+                    layer.weights.size() != static_cast<std::size_t>(layer.filters) *
+                        layer.input.c * layer.size * layer.size)
+                    throw std::runtime_error("initialize or load deconvolutional classifier weights before training");
+                deconvolutional_forward(layer, previous.data(), result.data());
             } else if (layer.kind == Kind::maxpool) {
                 max_index[t][index].resize(result.size());
                 const int pad = (layer.size - 1) / 2;
@@ -338,6 +398,12 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                 result = network_.cells_[index]->step(previous);
             } else if (layer.kind == Kind::l2norm) {
                 preactivation[t][index] = {l2norm_forward(previous.data(), result.data(), result.size())};
+            } else if (layer.kind == Kind::normalization) {
+                auto& norms = preactivation[t][index];
+                norms.resize(result.size());
+                normalization_forward(previous.data(), result.data(), norms.data(), layer.input.c,
+                    layer.input.h * layer.input.w, layer.size, layer.norm_alpha, layer.norm_beta,
+                    layer.norm_kappa);
             } else {  // softmax
                 float maximum = *std::max_element(previous.begin(), previous.end());
                 float total = 0.0f;
@@ -387,6 +453,13 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                     l2norm_backward(output[t][reverse].data(), gradient[t][reverse].data(),
                                     gradient[t][reverse - 1].data(), output[t][reverse].size(),
                                     preactivation[t][reverse][0]);
+        } else if (layer.kind == Kind::normalization) {
+            if (reverse)
+                for (std::size_t t = 0; t < T; ++t)
+                    normalization_backward(output[t][reverse - 1].data(), output[t][reverse].data(),
+                        preactivation[t][reverse].data(), gradient[t][reverse].data(),
+                        gradient[t][reverse - 1].data(), layer.input.c, layer.input.h * layer.input.w,
+                        layer.size, layer.norm_alpha, layer.norm_beta);
         } else if (layer.kind == Kind::connected) {
             std::vector<float> weight_grad(layer.weights.size(), 0.0f);
             std::vector<float> bias_grad(layer.biases.size(), 0.0f);
@@ -404,6 +477,30 @@ std::vector<ClassificationResult> ClassificationTrainer::train_sequence(
                     }
                 }
             }
+            for (std::size_t j = 0; j < layer.weights.size(); ++j)
+                layer.weights[j] -= learning_rate_ * (weight_grad[j] * inv_t + weight_decay_ * layer.weights[j]);
+            for (std::size_t j = 0; j < layer.biases.size(); ++j)
+                layer.biases[j] -= learning_rate_ * bias_grad[j] * inv_t;
+        } else if (layer.kind == Kind::local) {
+            std::vector<float> weight_grad(layer.weights.size(), 0.0f);
+            std::vector<float> bias_grad(layer.biases.size(), 0.0f);
+            for (std::size_t t = 0; t < T; ++t)
+                local_backward(layer, (reverse ? output[t][reverse - 1] : inputs[t]).data(),
+                    output[t][reverse].data(), gradient[t][reverse].data(),
+                    reverse ? gradient[t][reverse - 1].data() : nullptr,
+                    weight_grad.data(), bias_grad.data());
+            for (std::size_t j = 0; j < layer.weights.size(); ++j)
+                layer.weights[j] -= learning_rate_ * (weight_grad[j] * inv_t + weight_decay_ * layer.weights[j]);
+            for (std::size_t j = 0; j < layer.biases.size(); ++j)
+                layer.biases[j] -= learning_rate_ * bias_grad[j] * inv_t;
+        } else if (layer.kind == Kind::deconvolutional) {
+            std::vector<float> weight_grad(layer.weights.size(), 0.0f);
+            std::vector<float> bias_grad(layer.biases.size(), 0.0f);
+            for (std::size_t t = 0; t < T; ++t)
+                deconvolutional_backward(layer, (reverse ? output[t][reverse - 1] : inputs[t]).data(),
+                    output[t][reverse].data(), gradient[t][reverse].data(),
+                    reverse ? gradient[t][reverse - 1].data() : nullptr,
+                    weight_grad.data(), bias_grad.data());
             for (std::size_t j = 0; j < layer.weights.size(); ++j)
                 layer.weights[j] -= learning_rate_ * (weight_grad[j] * inv_t + weight_decay_ * layer.weights[j]);
             for (std::size_t j = 0; j < layer.biases.size(); ++j)

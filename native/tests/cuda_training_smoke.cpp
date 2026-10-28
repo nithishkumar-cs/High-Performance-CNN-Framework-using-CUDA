@@ -351,6 +351,20 @@ int main() {
         check_parity((directory / "avgpool-train.cfg").string(), average_input,
                      {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 2, "avgpool");
 
+        check_parity((directory / "normalization-train.cfg").string(),
+                     {0.2f, 0.4f, 0.6f}, {{0, 0.5f, 0.5f, 0.3f, 0.3f}},
+                     5, 2, "normalization");
+
+        std::vector<float> local_input(detector::Network::from_cfg((directory / "local-train.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < local_input.size(); ++i) local_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        check_parity((directory / "local-train.cfg").string(), local_input,
+                     {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 2, "local");
+
+        std::vector<float> deconv_input(detector::Network::from_cfg((directory / "deconv-train.cfg").string()).input_shape().elements());
+        for (std::size_t i = 0; i < deconv_input.size(); ++i) deconv_input[i] = 0.1f + 0.05f * static_cast<float>(i % 7);
+        check_parity((directory / "deconv-train.cfg").string(), deconv_input,
+                     {{0, 0.5f, 0.5f, 0.3f, 0.3f}}, 5, 2, "deconvolutional");
+
         check_dropout_runs((directory / "dropout-train.cfg").string(), {0.4f}, {{0, 0.5f, 0.5f, 0.5f, 0.5f}}, 20);
 
         // Region has no learnable parameters of its own and no randomness (rescore just decodes

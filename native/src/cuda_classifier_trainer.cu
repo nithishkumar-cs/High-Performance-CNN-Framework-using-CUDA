@@ -1,6 +1,9 @@
 #include "detector/cuda_classifier_trainer.hpp"
 #include "detector/cuda_recurrent.hpp"
 #include "l2norm_cuda.cuh"
+#include "normalization_cuda.cuh"
+#include "local_cuda.cuh"
+#include "deconv_cuda.cuh"
 #include "avgpool_cuda.cuh"
 #ifdef DETECTOR_HAS_CUDA
 #include <cuda_runtime.h>
@@ -297,8 +300,9 @@ struct CudaClassificationTrainer::Impl {
             }
             if (layers[i].kind != Kind::connected && layers[i].kind != Kind::convolutional &&
                 layers[i].kind != Kind::maxpool && layers[i].kind != Kind::avgpool &&
-                layers[i].kind != Kind::l2norm)
-                throw std::runtime_error("CUDA classifier trainer supports connected, convolutional, maxpool, avgpool, l2norm, one recurrent layer, and softmax");
+                layers[i].kind != Kind::l2norm && layers[i].kind != Kind::normalization &&
+                layers[i].kind != Kind::local && layers[i].kind != Kind::deconvolutional)
+                throw std::runtime_error("unsupported layer in CUDA classifier trainer");
         }
         int devices = 0;
         check(cudaGetDeviceCount(&devices), "cudaGetDeviceCount");
@@ -320,7 +324,29 @@ struct CudaClassificationTrainer::Impl {
                 continue;
             }
             if (layer.kind == Kind::l2norm || layer.kind == Kind::avgpool) continue;
+            if (layer.kind == Kind::normalization) {
+                preactivation[i] = memory.allocate(layer.output.elements());
+                continue;
+            }
             if (static_cast<int>(i) == recurrent_index) continue;
+            if (layer.kind == Kind::deconvolutional) {
+                if (layer.weights.size() != static_cast<std::size_t>(layer.filters) * layer.input.c *
+                        layer.size * layer.size ||
+                    layer.biases.size() != static_cast<std::size_t>(layer.filters))
+                    throw std::runtime_error("initialize or load deconvolutional classifier weights before CUDA training");
+                weights[i] = memory.upload(layer.weights);
+                biases[i] = memory.upload(layer.biases);
+                continue;
+            }
+            if (layer.kind == Kind::local) {
+                const std::size_t locations = static_cast<std::size_t>(layer.output.h) * layer.output.w;
+                if (layer.weights.size() != locations * layer.filters * layer.input.c * layer.size * layer.size ||
+                    layer.biases.size() != layer.output.elements())
+                    throw std::runtime_error("initialize or load local classifier weights before CUDA training");
+                weights[i] = memory.upload(layer.weights);
+                biases[i] = memory.upload(layer.biases);
+                continue;
+            }
             const std::size_t inputs = layer.input.elements();
             std::size_t fan_in = layer.kind == Kind::connected ? inputs :
                 static_cast<std::size_t>(layer.input.c) * layer.size * layer.size;
@@ -361,9 +387,24 @@ struct CudaClassificationTrainer::Impl {
                     layer.input.c, layer.input.h, layer.input.w,
                     layer.output.c, layer.output.h, layer.output.w,
                     layer.size, layer.stride, layer.padding, layer.leaky);
+            else if (layer.kind == Kind::deconvolutional)
+                deconv_forward_kernel<<<(static_cast<int>(layer.output.elements()) + threads - 1) / threads, threads>>>(
+                    previous, weights[i], biases[i], output[i], static_cast<int>(layer.output.elements()),
+                    layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                    layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky, layer.logistic);
+            else if (layer.kind == Kind::local)
+                local_forward_kernel<<<(static_cast<int>(layer.output.elements()) + threads - 1) / threads, threads>>>(
+                    previous, weights[i], biases[i], output[i], static_cast<int>(layer.output.elements()),
+                    layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                    layer.output.w, layer.size, layer.stride, layer.padding, layer.leaky, layer.logistic);
             else if (layer.kind == Kind::l2norm)
                 l2norm_forward_kernel<<<1, threads>>>(previous, output[i],
                     static_cast<int>(layer.output.elements()));
+            else if (layer.kind == Kind::normalization)
+                normalization_forward_kernel<<<(static_cast<int>(layer.output.elements()) + threads - 1) / threads, threads>>>(
+                    previous, output[i], preactivation[i], static_cast<int>(layer.output.elements()),
+                    layer.input.c, layer.input.h * layer.input.w, layer.size,
+                    layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
             else if (layer.kind == Kind::avgpool)
                 avgpool_forward_kernel<<<layer.input.c, threads>>>(previous, output[i],
                     layer.input.c, layer.input.h * layer.input.w);
@@ -412,6 +453,19 @@ struct CudaClassificationTrainer::Impl {
                 }
                 continue;
             }
+            if (layer.kind == Kind::normalization) {
+                if (reverse) {
+                    check(cudaMemset(gradient[reverse - 1], 0, inputs * sizeof(float)),
+                          "cudaMemset normalization input gradient");
+                    normalization_backward_kernel<<<(inputs + threads - 1) / threads, threads>>>(
+                        reverse ? output[reverse - 1] : input, output[reverse],
+                        preactivation[reverse], gradient[reverse],
+                        gradient[reverse - 1], inputs, layer.input.c,
+                        layer.input.h * layer.input.w, layer.size, layer.norm_alpha, layer.norm_beta);
+                    launch_check();
+                }
+                continue;
+            }
             if (layer.kind == Kind::avgpool) {
                 if (reverse) {
                     check(cudaMemset(gradient[reverse - 1], 0, inputs * sizeof(float)),
@@ -423,6 +477,57 @@ struct CudaClassificationTrainer::Impl {
                 continue;
             }
             int count = static_cast<int>(layer.output.elements());
+            if (layer.kind == Kind::deconvolutional) {
+                deconv_activation_backward_kernel<<<(count + threads - 1) / threads, threads>>>(
+                    output[reverse], gradient[reverse], count, layer.leaky, layer.logistic);
+                launch_check();
+                if (reverse) {
+                    check(cudaMemset(gradient[reverse - 1], 0, inputs * sizeof(float)),
+                          "cudaMemset deconvolution input gradient");
+                    deconv_backward_input_kernel<<<(inputs + threads - 1) / threads, threads>>>(
+                        gradient[reverse], weights[reverse], gradient[reverse - 1], inputs,
+                        layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                        layer.output.w, layer.size, layer.stride, layer.padding);
+                    launch_check();
+                }
+                const int weight_count = static_cast<int>(layer.weights.size());
+                deconv_sgd_weights_kernel<<<(weight_count + threads - 1) / threads, threads>>>(
+                    weights[reverse], reverse ? output[reverse - 1] : input, gradient[reverse],
+                    weight_count, 1, layer.input.c, layer.input.h, layer.input.w, layer.filters,
+                    layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding,
+                    learning_rate, weight_decay);
+                launch_check();
+                deconv_sgd_biases_kernel<<<(layer.filters + threads - 1) / threads, threads>>>(
+                    biases[reverse], gradient[reverse], layer.filters,
+                    layer.output.h * layer.output.w, 1, learning_rate);
+                launch_check();
+                continue;
+            }
+            if (layer.kind == Kind::local) {
+                local_activation_backward_kernel<<<(count + threads - 1) / threads, threads>>>(
+                    output[reverse], gradient[reverse], count, layer.leaky, layer.logistic);
+                launch_check();
+                if (reverse) {
+                    check(cudaMemset(gradient[reverse - 1], 0, inputs * sizeof(float)),
+                          "cudaMemset local input gradient");
+                    local_backward_input_kernel<<<(inputs + threads - 1) / threads, threads>>>(
+                        gradient[reverse], weights[reverse], gradient[reverse - 1], inputs,
+                        layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                        layer.output.w, layer.size, layer.stride, layer.padding);
+                    launch_check();
+                }
+                const int weight_count = static_cast<int>(layer.weights.size());
+                local_sgd_weights_kernel<<<(weight_count + threads - 1) / threads, threads>>>(
+                    weights[reverse], reverse ? output[reverse - 1] : input, gradient[reverse],
+                    weight_count, 1, layer.input.c, layer.input.h, layer.input.w, layer.filters,
+                    layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding,
+                    learning_rate, weight_decay);
+                launch_check();
+                local_sgd_biases_kernel<<<(count + threads - 1) / threads, threads>>>(
+                    biases[reverse], gradient[reverse], count, 1, learning_rate);
+                launch_check();
+                continue;
+            }
             activation_backward<<<(count + threads - 1) / threads, threads>>>(
                 gradient[reverse], preactivation[reverse], count, layer.leaky);
             launch_check();
@@ -497,7 +602,8 @@ struct CudaClassificationTrainer::Impl {
             if (layers[i].kind == Kind::softmax) continue;
             derivatives[i] = sequence_memory.allocate(count);
             check(cudaMemset(derivatives[i], 0, count * sizeof(float)), "cudaMemset sequence gradient");
-            if (layers[i].kind == Kind::connected || layers[i].kind == Kind::convolutional)
+            if (layers[i].kind == Kind::connected || layers[i].kind == Kind::convolutional ||
+                layers[i].kind == Kind::normalization)
                 pre[i] = sequence_memory.allocate(count);
             if (layers[i].kind == Kind::maxpool)
                 indices[i] = sequence_memory.allocate_int(count);
@@ -543,8 +649,23 @@ struct CudaClassificationTrainer::Impl {
                         indices[i] + static_cast<std::size_t>(t) * out_count,
                         layer.input.c, layer.input.h, layer.input.w, layer.output.h, layer.output.w,
                         layer.size, layer.stride);
+                else if (layer.kind == Kind::deconvolutional)
+                    deconv_forward_kernel<<<(out_count + threads - 1) / threads, threads>>>(
+                        source, weights[i], biases[i], destination, out_count, layer.input.c,
+                        layer.input.h, layer.input.w, layer.filters, layer.output.h, layer.output.w,
+                        layer.size, layer.stride, layer.padding, layer.leaky, layer.logistic);
+                else if (layer.kind == Kind::local)
+                    local_forward_kernel<<<(out_count + threads - 1) / threads, threads>>>(
+                        source, weights[i], biases[i], destination, out_count, layer.input.c,
+                        layer.input.h, layer.input.w, layer.filters, layer.output.h, layer.output.w,
+                        layer.size, layer.stride, layer.padding, layer.leaky, layer.logistic);
                 else if (layer.kind == Kind::l2norm)
                     l2norm_forward_kernel<<<1, threads>>>(source, destination, out_count);
+                else if (layer.kind == Kind::normalization)
+                    normalization_forward_kernel<<<(out_count + threads - 1) / threads, threads>>>(
+                        source, destination, pre[i] + static_cast<std::size_t>(t) * out_count,
+                        out_count, layer.input.c, layer.input.h * layer.input.w, layer.size,
+                        layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
                 else if (layer.kind == Kind::avgpool)
                     avgpool_forward_kernel<<<layer.input.c, threads>>>(source, destination,
                         layer.input.c, layer.input.h * layer.input.w);
@@ -615,12 +736,52 @@ struct CudaClassificationTrainer::Impl {
                     launch_check("CUDA classifier sequence l2norm backward");
                     continue;
                 }
+                if (layer.kind == Kind::normalization) {
+                    if (reverse)
+                        normalization_backward_kernel<<<(in_count + threads - 1) / threads, threads>>>(
+                            previous + static_cast<std::size_t>(t) * in_count,
+                            values[reverse] + static_cast<std::size_t>(t) * out_count,
+                            pre[reverse] + static_cast<std::size_t>(t) * out_count,
+                            grad, derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count,
+                            in_count, layer.input.c, layer.input.h * layer.input.w, layer.size,
+                            layer.norm_alpha, layer.norm_beta);
+                    launch_check("CUDA classifier sequence normalization backward");
+                    continue;
+                }
                 if (layer.kind == Kind::avgpool) {
                     if (reverse)
                         avgpool_backward_kernel<<<(in_count + threads - 1) / threads, threads>>>(
                             grad, derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count,
                             layer.input.h * layer.input.w, in_count);
                     launch_check("CUDA classifier sequence avgpool backward");
+                    continue;
+                }
+                if (layer.kind == Kind::deconvolutional) {
+                    deconv_activation_backward_kernel<<<(out_count + threads - 1) / threads, threads>>>(
+                        values[reverse] + static_cast<std::size_t>(t) * out_count, grad, out_count,
+                        layer.leaky, layer.logistic);
+                    launch_check("CUDA classifier sequence deconvolution activation backward");
+                    if (reverse)
+                        deconv_backward_input_kernel<<<(in_count + threads - 1) / threads, threads>>>(
+                            grad, weights[reverse],
+                            derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count, in_count,
+                            layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                            layer.output.w, layer.size, layer.stride, layer.padding);
+                    launch_check("CUDA classifier sequence deconvolution input backward");
+                    continue;
+                }
+                if (layer.kind == Kind::local) {
+                    local_activation_backward_kernel<<<(out_count + threads - 1) / threads, threads>>>(
+                        values[reverse] + static_cast<std::size_t>(t) * out_count, grad, out_count,
+                        layer.leaky, layer.logistic);
+                    launch_check("CUDA classifier sequence local activation backward");
+                    if (reverse)
+                        local_backward_input_kernel<<<(in_count + threads - 1) / threads, threads>>>(
+                            grad, weights[reverse],
+                            derivatives[reverse - 1] + static_cast<std::size_t>(t) * in_count, in_count,
+                            layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                            layer.output.w, layer.size, layer.stride, layer.padding);
+                    launch_check("CUDA classifier sequence local input backward");
                     continue;
                 }
                 activation_backward<<<(out_count + threads - 1) / threads, threads>>>(
@@ -637,7 +798,33 @@ struct CudaClassificationTrainer::Impl {
                         layer.output.c, layer.output.h, layer.output.w, layer.size, layer.stride, layer.padding);
                 launch_check("CUDA classifier sequence input backward");
             }
-            if (layer.kind == Kind::maxpool || layer.kind == Kind::avgpool || layer.kind == Kind::l2norm) continue;
+            if (layer.kind == Kind::maxpool || layer.kind == Kind::avgpool || layer.kind == Kind::l2norm ||
+                layer.kind == Kind::normalization) continue;
+            if (layer.kind == Kind::deconvolutional) {
+                const int weight_count = static_cast<int>(layer.weights.size());
+                deconv_sgd_weights_kernel<<<(weight_count + threads - 1) / threads, threads>>>(
+                    weights[reverse], previous, derivatives[reverse], weight_count, steps,
+                    layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                    layer.output.w, layer.size, layer.stride, layer.padding, learning_rate, weight_decay);
+                launch_check("CUDA classifier sequence deconvolution weight SGD");
+                deconv_sgd_biases_kernel<<<(layer.filters + threads - 1) / threads, threads>>>(
+                    biases[reverse], derivatives[reverse], layer.filters,
+                    layer.output.h * layer.output.w, steps, learning_rate);
+                launch_check("CUDA classifier sequence deconvolution bias SGD");
+                continue;
+            }
+            if (layer.kind == Kind::local) {
+                const int weight_count = static_cast<int>(layer.weights.size());
+                local_sgd_weights_kernel<<<(weight_count + threads - 1) / threads, threads>>>(
+                    weights[reverse], previous, derivatives[reverse], weight_count, steps,
+                    layer.input.c, layer.input.h, layer.input.w, layer.filters, layer.output.h,
+                    layer.output.w, layer.size, layer.stride, layer.padding, learning_rate, weight_decay);
+                launch_check("CUDA classifier sequence local weight SGD");
+                local_sgd_biases_kernel<<<(out_count + threads - 1) / threads, threads>>>(
+                    biases[reverse], derivatives[reverse], out_count, steps, learning_rate);
+                launch_check("CUDA classifier sequence local bias SGD");
+                continue;
+            }
             if (layer.kind == Kind::connected)
                 dense_sequence_sgd<<<(in_count * out_count + threads - 1) / threads, threads>>>(
                     weights[reverse], biases[reverse], derivatives[reverse], previous,
@@ -666,6 +853,7 @@ struct CudaClassificationTrainer::Impl {
         for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
             auto& layer = layers[i];
             if (layer.kind == Kind::maxpool || layer.kind == Kind::avgpool || layer.kind == Kind::l2norm ||
+                layer.kind == Kind::normalization ||
                 static_cast<int>(i) == recurrent_index) continue;
             check(cudaMemcpy(layer.weights.data(), weights[i],
                              layer.weights.size() * sizeof(float), cudaMemcpyDeviceToHost),

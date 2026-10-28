@@ -1,5 +1,8 @@
 #include "detector/trainer.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/normalization.hpp"
+#include "detector/local.hpp"
+#include "detector/deconvolutional.hpp"
 #include "detector/avgpool.hpp"
 #include "detector/yolo_loss.hpp"
 #include <algorithm>
@@ -33,8 +36,10 @@ void Network::initialize_random(std::uint32_t seed) {
                                static_cast<unsigned>(rng()));
             continue;
         }
-        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
-        const std::size_t count = static_cast<std::size_t>(layer.filters);
+        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected &&
+            layer.kind != Kind::local && layer.kind != Kind::deconvolutional) continue;
+        const std::size_t count = layer.kind == Kind::local ? layer.output.elements() :
+            static_cast<std::size_t>(layer.filters);
         layer.biases.assign(count, 0.0f);
         if (layer.batch_normalize) {
             layer.scales.assign(count, 1.0f);
@@ -63,7 +68,8 @@ void Network::save_weights(const std::string& path) const {
             write_floats(file, cells_[i]->parameter_values());
             continue;
         }
-        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
+        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected &&
+            layer.kind != Kind::local && layer.kind != Kind::deconvolutional) continue;
         write_floats(file, layer.biases);
         if (layer.batch_normalize) {
             write_floats(file, layer.scales);
@@ -216,6 +222,20 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                             }
                 }
             }
+        } else if (layer.kind == Kind::local) {
+            if (layer.biases.size() != layer.output.elements() ||
+                layer.weights.size() != layer.output.elements() *
+                    static_cast<std::size_t>(layer.input.c) * layer.size * layer.size)
+                throw std::runtime_error("initialize or load local weights before training");
+            for (std::size_t s = 0; s < n; ++s)
+                local_forward(layer, previous_of(s).data(), output[s][index].data());
+        } else if (layer.kind == Kind::deconvolutional) {
+            if (layer.biases.size() != static_cast<std::size_t>(layer.filters) ||
+                layer.weights.size() != static_cast<std::size_t>(layer.filters) *
+                    layer.input.c * layer.size * layer.size)
+                throw std::runtime_error("initialize or load deconvolutional weights before training");
+            for (std::size_t s = 0; s < n; ++s)
+                deconvolutional_forward(layer, previous_of(s).data(), output[s][index].data());
         } else if (layer.kind == Kind::shortcut) {
             for (std::size_t s = 0; s < n; ++s) {
                 const auto& previous = previous_of(s);
@@ -297,6 +317,15 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                 auto& result = output[s][index];
                 float inverse = l2norm_forward(previous_of(s).data(), result.data(), result.size());
                 preactivation[s][index] = {inverse};
+            }
+        } else if (layer.kind == Kind::normalization) {
+            for (std::size_t s = 0; s < n; ++s) {
+                auto& result = output[s][index];
+                auto& norms = preactivation[s][index];
+                norms.resize(result.size());
+                normalization_forward(previous_of(s).data(), result.data(), norms.data(),
+                    layer.input.c, layer.input.h * layer.input.w, layer.size,
+                    layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
             }
         } else if (layer.kind == Kind::reorg) {
             // Space-to-depth rearrangement (see network.cpp's reorg_forward for the shared
@@ -415,6 +444,13 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                 l2norm_backward(output[s][reverse].data(), gradient[s][reverse].data(),
                                 gradient[s][reverse - 1].data(), output[s][reverse].size(),
                                 preactivation[s][reverse][0]);
+        } else if (layer.kind == Kind::normalization) {
+            if (!reverse) continue;
+            for (std::size_t s = 0; s < n; ++s)
+                normalization_backward(output[s][reverse - 1].data(), output[s][reverse].data(),
+                    preactivation[s][reverse].data(), gradient[s][reverse].data(),
+                    gradient[s][reverse - 1].data(), layer.input.c, layer.input.h * layer.input.w,
+                    layer.size, layer.norm_alpha, layer.norm_beta);
         } else if (layer.kind == Kind::reorg) {
             if (!reverse) continue;
             int in_plane = layer.input.h * layer.input.w;
@@ -429,6 +465,22 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
                                 grad[static_cast<std::size_t>(oc) * out_plane + (iy / layer.stride) * out_w + (ix / layer.stride)];
                         }
             }
+        } else if (layer.kind == Kind::local) {
+            if (weight_grad_[reverse].empty()) weight_grad_[reverse].assign(layer.weights.size(), 0.0f);
+            if (bias_grad_[reverse].empty()) bias_grad_[reverse].assign(layer.biases.size(), 0.0f);
+            for (std::size_t s = 0; s < n; ++s)
+                local_backward(layer, (reverse ? output[s][reverse - 1] : inputs[s]).data(),
+                    output[s][reverse].data(), gradient[s][reverse].data(),
+                    reverse ? gradient[s][reverse - 1].data() : nullptr,
+                    weight_grad_[reverse].data(), bias_grad_[reverse].data());
+        } else if (layer.kind == Kind::deconvolutional) {
+            if (weight_grad_[reverse].empty()) weight_grad_[reverse].assign(layer.weights.size(), 0.0f);
+            if (bias_grad_[reverse].empty()) bias_grad_[reverse].assign(layer.biases.size(), 0.0f);
+            for (std::size_t s = 0; s < n; ++s)
+                deconvolutional_backward(layer, (reverse ? output[s][reverse - 1] : inputs[s]).data(),
+                    output[s][reverse].data(), gradient[s][reverse].data(),
+                    reverse ? gradient[s][reverse - 1].data() : nullptr,
+                    weight_grad_[reverse].data(), bias_grad_[reverse].data());
         } else {
             // Convolution (and, for batch_normalize layers, true batch-norm) backward.
             int in_plane = layer.input.h * layer.input.w;
@@ -504,7 +556,8 @@ TrainResult Trainer::step(const std::vector<std::vector<float>>& inputs,
     float inv_n = 1.0f / static_cast<float>(n);
     for (std::size_t index = 0; index < num_layers; ++index) {
         auto& layer = layers[index];
-        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
+        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected &&
+            layer.kind != Kind::local && layer.kind != Kind::deconvolutional) continue;
         if (weight_velocity_[index].empty()) weight_velocity_[index].assign(layer.weights.size(), 0.0f);
         if (bias_velocity_[index].empty()) bias_velocity_[index].assign(layer.biases.size(), 0.0f);
         for (std::size_t p = 0; p < layer.weights.size(); ++p) {

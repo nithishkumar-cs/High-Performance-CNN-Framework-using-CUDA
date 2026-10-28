@@ -1,5 +1,8 @@
 #include "detector/network.hpp"
 #include "detector/l2norm.hpp"
+#include "detector/normalization.hpp"
+#include "detector/local.hpp"
+#include "detector/deconvolutional.hpp"
 #include "detector/avgpool.hpp"
 #include <algorithm>
 #include <cmath>
@@ -111,6 +114,18 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
         if (nh < 0 || nw < 0) throw std::runtime_error("convolution filter exceeds input");
         return {layer.filters, nh / layer.stride + 1, nw / layer.stride + 1};
     }
+    case Kind::local: {
+        int nh = shape.h + 2 * layer.padding - layer.size;
+        int nw = shape.w + 2 * layer.padding - layer.size;
+        if (nh < 0 || nw < 0) throw std::runtime_error("local filter exceeds input");
+        return {layer.filters, nh / layer.stride + 1, nw / layer.stride + 1};
+    }
+    case Kind::deconvolutional: {
+        const int nh = layer.stride * (shape.h - 1) + layer.size - 2 * layer.padding;
+        const int nw = layer.stride * (shape.w - 1) + layer.size - 2 * layer.padding;
+        if (nh <= 0 || nw <= 0) throw std::runtime_error("deconvolutional padding exceeds output");
+        return {layer.filters, nh, nw};
+    }
     case Kind::maxpool:
         return {shape.c, (shape.h - 1) / layer.stride + 1, (shape.w - 1) / layer.stride + 1};
     case Kind::avgpool:
@@ -136,6 +151,7 @@ Shape layer_output_shape(const Layer& layer, Shape shape, const std::vector<Laye
         return {shape.c, shape.h * layer.stride, shape.w * layer.stride};
     case Kind::dropout:
     case Kind::l2norm:
+    case Kind::normalization:
         return shape;
     case Kind::reorg: {
         if (shape.h % layer.stride != 0 || shape.w % layer.stride != 0)
@@ -228,7 +244,11 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
         const auto& source = index ? outputs[index - 1] : input;
         auto& out = outputs[index];
         out.resize(layer.output.elements());
-        if (layer.kind == Kind::convolutional) {
+        if (layer.kind == Kind::local) {
+            local_forward(layer, source.data(), out.data());
+        } else if (layer.kind == Kind::deconvolutional) {
+            deconvolutional_forward(layer, source.data(), out.data());
+        } else if (layer.kind == Kind::convolutional) {
             int in_plane = layer.input.h * layer.input.w;
             int out_plane = layer.output.h * layer.output.w;
             for (int oc = 0; oc < layer.output.c; ++oc) {
@@ -310,6 +330,10 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
             out = source;  // no-op at inference, matching Darknet (dropout only affects training)
         } else if (layer.kind == Kind::l2norm) {
             l2norm_forward(source.data(), out.data(), out.size());
+        } else if (layer.kind == Kind::normalization) {
+            normalization_forward(source.data(), out.data(), nullptr, layer.input.c,
+                                  layer.input.h * layer.input.w, layer.size,
+                                  layer.norm_alpha, layer.norm_beta, layer.norm_kappa);
         } else if (layer.kind == Kind::reorg) {
             reorg_forward(source, out, layer.input.c, layer.input.h, layer.input.w, layer.stride);
         } else if (layer.kind == Kind::rnn || layer.kind == Kind::lstm || layer.kind == Kind::gru) {
@@ -356,6 +380,36 @@ Network Network::from_cfg(const std::string& path) {
             auto activation = option(section, "activation", "linear");
             if (activation != "linear" && activation != "leaky") throw std::runtime_error("unsupported activation: " + activation);
             layer.leaky = activation == "leaky";
+        } else if (section.name == "local") {
+            layer.kind = Kind::local;
+            layer.filters = integer(section, "filters", "1");
+            layer.size = integer(section, "size", "1");
+            layer.stride = integer(section, "stride", "1");
+            layer.padding = integer(section, "pad", "0");
+            positive(layer.filters, "local filters"); positive(layer.size, "local size");
+            positive(layer.stride, "local stride");
+            if (layer.padding < 0) throw std::runtime_error("negative local padding");
+            auto activation = option(section, "activation", "logistic");
+            if (activation != "linear" && activation != "leaky" && activation != "logistic")
+                throw std::runtime_error("unsupported local activation: " + activation);
+            layer.leaky = activation == "leaky";
+            layer.logistic = activation == "logistic";
+        } else if (section.name == "deconvolutional") {
+            layer.kind = Kind::deconvolutional;
+            layer.filters = integer(section, "filters", "1");
+            layer.size = integer(section, "size", "1");
+            layer.stride = integer(section, "stride", "1");
+            layer.padding = integer(section, "pad", "0");
+            positive(layer.filters, "deconvolutional filters"); positive(layer.size, "deconvolutional size");
+            positive(layer.stride, "deconvolutional stride");
+            if (layer.padding < 0) throw std::runtime_error("negative deconvolutional padding");
+            if (integer(section, "batch_normalize", "0") != 0)
+                throw std::runtime_error("batch_normalize is unsupported on deconvolutional layers");
+            auto activation = option(section, "activation", "logistic");
+            if (activation != "linear" && activation != "leaky" && activation != "logistic")
+                throw std::runtime_error("unsupported deconvolutional activation: " + activation);
+            layer.leaky = activation == "leaky";
+            layer.logistic = activation == "logistic";
         } else if (section.name == "maxpool") {
             layer.kind = Kind::maxpool;
             layer.size = integer(section, "size");
@@ -381,6 +435,17 @@ Network Network::from_cfg(const std::string& path) {
                 throw std::runtime_error("dropout probability must be in (0,1)");
         } else if (section.name == "l2norm") {
             layer.kind = Kind::l2norm;
+        } else if (section.name == "normalization") {
+            layer.kind = Kind::normalization;
+            layer.size = integer(section, "size", "5");
+            positive(layer.size, "normalization size");
+            layer.norm_alpha = floating(section, "alpha", "0.0001");
+            layer.norm_beta = floating(section, "beta", "0.75");
+            layer.norm_kappa = floating(section, "kappa", "1");
+            if (!std::isfinite(layer.norm_alpha) || layer.norm_alpha < 0 ||
+                !std::isfinite(layer.norm_beta) || layer.norm_beta < 0 ||
+                !std::isfinite(layer.norm_kappa) || layer.norm_kappa <= 0)
+                throw std::runtime_error("invalid normalization parameters");
         } else if (section.name == "reorg") {
             layer.kind = Kind::reorg;
             layer.stride = integer(section, "stride", "2");
@@ -497,6 +562,12 @@ void Network::resize(int width, int height) {
         // flat sequence inputs with no spatial dimension to jitter).
         if (cells_[i] && cells_[i]->input_size() != static_cast<int>(layer.input.elements()))
             throw std::runtime_error("resize is unsupported for cfgs containing an rnn/lstm/gru layer");
+        // Local layers own one filter bank per output location, so their parameter count depends
+        // on the spatial size and cannot survive a resize.
+        if (layer.kind == Kind::local && !layer.weights.empty() &&
+            layer.weights.size() != static_cast<std::size_t>(layer.output.h) * layer.output.w *
+                layer.filters * layer.input.c * layer.size * layer.size)
+            throw std::runtime_error("resize is unsupported for cfgs containing a local layer");
         shape = layer.output;
     }
 }
@@ -527,8 +598,10 @@ void Network::load_weights(const std::string& path, int layer_limit) {
             for (std::size_t p = 0; p < pointers.size(); ++p) *pointers[p] = flat[p];
             continue;
         }
-        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected) continue;
-        auto count = static_cast<std::size_t>(layer.filters);
+        if (layer.kind != Kind::convolutional && layer.kind != Kind::connected &&
+            layer.kind != Kind::local && layer.kind != Kind::deconvolutional) continue;
+        auto count = layer.kind == Kind::local ? layer.output.elements() :
+            static_cast<std::size_t>(layer.filters);
         read_floats(file, layer.biases, count, i);
         if (layer.kind == Kind::convolutional && layer.batch_normalize) {
             read_floats(file, layer.scales, count, i);
@@ -547,7 +620,9 @@ void Network::load_weights(const std::string& path, int layer_limit) {
 
 std::vector<Head> Network::forward(const std::vector<float>& input, Backend backend) const {
     if (input.size() != input_.elements()) throw std::runtime_error("input does not match cfg shape");
-    for (const auto& layer : layers_) if ((layer.kind == Kind::convolutional || layer.kind == Kind::connected) && layer.biases.empty())
+    for (const auto& layer : layers_) if ((layer.kind == Kind::convolutional || layer.kind == Kind::connected ||
+                                           layer.kind == Kind::local || layer.kind == Kind::deconvolutional) &&
+                                          layer.biases.empty())
         throw std::runtime_error("load weights before inference");
     for (std::size_t i = 0; i < layers_.size(); ++i)
         if ((layers_[i].kind == Kind::rnn || layers_[i].kind == Kind::lstm || layers_[i].kind == Kind::gru) && !cells_[i])

@@ -267,12 +267,18 @@ int main() {
         exercise_single_step_parity(directory / "classifier-conv.cfg");
         exercise_single_step_parity(directory / "l2norm-classifier.cfg");
         exercise_single_step_parity(directory / "avgpool-classifier.cfg");
+        exercise_single_step_parity(directory / "normalization-classifier.cfg");
+        exercise_single_step_parity(directory / "local-classifier.cfg");
+        exercise_single_step_parity(directory / "deconv-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "lstm-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "gru-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-conv-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-l2norm-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-avgpool-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "rnn-normalization-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "rnn-local-classifier.cfg");
+        exercise_cuda_sequence_parity(directory / "rnn-deconv-classifier.cfg");
 #endif
         return 0;
     } catch (const std::exception& error) {

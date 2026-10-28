@@ -238,6 +238,18 @@ YOLO inference path.
 - Hand-computed two-channel means and input gradients pass; small detector and classifier graphs
   verify CPU/CUDA forward and parameter-update parity, including an RNN sequence.
 
+**2026-10-28 — Channel-local response normalization.**
+- Added `[normalization]` with configurable channel-window size, alpha, beta, and kappa to CPU/CUDA
+  inference, detector minibatch training, classifier SGD, and recurrent classifier chunks.
+- A hand-computed channel-window case, central finite-difference input-gradient check, CPU/CUDA
+  inference parity, detector minibatch parity, and classifier single-step/sequence parity pass.
+
+**2026-10-28 � `[local]` and `[deconvolutional]` layers.**
+- Added a locally connected layer (one filter bank per output location) and a transposed-convolution
+  layer to CPU/CUDA inference, detector minibatch training, classifier SGD and recurrent classifier chunks.
+- Verified with hand-computed outputs, finite-difference input/weight/bias gradient checks, CPU/CUDA
+  inference parity and detector/classifier (single-step and RNN sequence) training parity.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

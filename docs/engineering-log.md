@@ -207,6 +207,22 @@ YOLO inference path.
   `aeca7f625a307cb9012e4821814c71c818cfa74c0a1f7234d204be8bd049920`. Training and
   evaluation output is under `.agent-work/logs/deep_cnn_*`.
 
+**2026-10-27 — YOLOv2 and full YOLOv3 deployed on Jetson Orin Nano Super.**
+- Generalized ONNX export and TensorRT inference from two YOLOv3-tiny heads to one YOLOv2
+  `[region]` head or three full-YOLOv3 `[yolo]` heads. The exporter also gained shortcut and
+  reorg support; fixing its route shape check exposed the same pass-through bug already fixed
+  in the native graph. Jetson CTest passed 18/18 after syncing the native tree.
+- Built FP32 and FP16 TensorRT engines for both native-trained full-budget checkpoints. On the
+  4,952-image VOC2007 test set (12,032 non-difficult objects, confidence 0.01, class-aware NMS
+  IoU 0.45), Jetson native CUDA / TensorRT FP32 / TensorRT FP16 mAP@0.5 was
+  **0.57177 / 0.57176 / 0.57151** for YOLOv2 and **0.61502 / 0.61479 / 0.61517** for
+  full YOLOv3. Laptop native-CUDA baselines were 0.57215 and 0.61593, respectively.
+- On the same held-out image `002570.jpg`, the native `cuda_detector benchmark` network-forward
+  scope (5 warmups, 30 iterations; excludes preprocessing, decode, NMS, file I/O and setup)
+  averaged **577.504 / 13.336 / 7.140 ms** for YOLOv2 and
+  **1246.484 / 25.476 / 11.082 ms** for full YOLOv3, in CUDA / TensorRT FP32 / FP16 order.
+  TensorRT engines were built and timed on the Jetson, not transferred from the laptop.
+
 ## Bugs found and fixed (debugging skills, concrete)
 
 1. **CUDA buffer overrun** — missing thread-bounds check in batch-norm kernels corrupted

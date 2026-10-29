@@ -345,6 +345,16 @@ std::vector<Head> cpu_forward(const Network& net, const std::vector<float>& inpu
             heads.push_back({index, out});
         }
     }
+    // A plain feedforward graph (VectorTrainer's regressor/tag cfgs, req-79) has no [softmax]/
+    // [yolo]/[region] head to push one above - its last layer is the output. Only the terminal
+    // layer qualifies (an intermediate connected/convolutional/etc. layer is not a result).
+    if (!layers.empty() && (heads.empty() || heads.back().layer != layers.size() - 1)) {
+        const auto& last_kind = layers.back().kind;
+        if (last_kind == Kind::connected || last_kind == Kind::convolutional || last_kind == Kind::local ||
+            last_kind == Kind::deconvolutional || last_kind == Kind::avgpool || last_kind == Kind::l2norm ||
+            last_kind == Kind::normalization)
+            heads.push_back({layers.size() - 1, outputs.back()});
+    }
     return heads;
 }
 
@@ -539,11 +549,19 @@ Network Network::from_cfg(const std::string& path) {
         // convolutional/connected layers start with empty weights/biases vectors.
         net.cells_.push_back(std::nullopt);
     }
-    if (net.layers_.empty() ||
-        (std::none_of(net.layers_.begin(), net.layers_.end(),
-                      [](const Layer& layer) { return layer.kind == Kind::yolo || layer.kind == Kind::region; }) &&
-         net.layers_.back().kind != Kind::softmax))
-        throw std::runtime_error("cfg needs a [yolo]/[region] head or final [softmax]");
+    // A detector cfg (has a yolo/region head) or classifier cfg (ends in softmax) is always
+    // valid, as before. A plain feedforward cfg ending in a layer that already produces a
+    // finished tensor (connected/convolutional/local/deconvolutional/avgpool/l2norm/
+    // normalization) is also valid - VectorTrainer's regressor/tag graphs (req-79), which
+    // apply their loss directly to that raw output instead of a [softmax]/[yolo] head.
+    const bool has_detection_head = std::any_of(net.layers_.begin(), net.layers_.end(),
+        [](const Layer& layer) { return layer.kind == Kind::yolo || layer.kind == Kind::region; });
+    const Kind last_kind = net.layers_.empty() ? Kind::softmax : net.layers_.back().kind;
+    const bool plain_terminal = last_kind == Kind::connected || last_kind == Kind::convolutional ||
+        last_kind == Kind::local || last_kind == Kind::deconvolutional || last_kind == Kind::avgpool ||
+        last_kind == Kind::l2norm || last_kind == Kind::normalization;
+    if (net.layers_.empty() || !(has_detection_head || last_kind == Kind::softmax || plain_terminal))
+        throw std::runtime_error("cfg needs a [yolo]/[region] head, a final [softmax], or a plain feedforward terminal layer");
     return net;
 }
 

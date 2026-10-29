@@ -122,6 +122,7 @@ private:
     friend class Trainer;
     friend class ClassificationTrainer;
     friend class CudaClassificationTrainer;
+    friend class VectorTrainer;
     // Lazily built in from_cfg() for every rnn/lstm/gru layer (input/hidden size are fixed then);
     // initialize_random()/load_weights() only overwrite its learned parameters, never resize it.
     // mutable so const forward()/classify() can still advance each cell's persistent hidden

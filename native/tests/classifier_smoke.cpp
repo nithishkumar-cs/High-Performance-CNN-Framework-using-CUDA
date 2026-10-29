@@ -248,6 +248,35 @@ void exercise_cuda_training(const fs::path& cfg) {
 }
 #endif
 
+/** VectorTrainer (regressor.c-style MSE, or tag.c-style multi-label sigmoid_bce) learns to
+ *  separate two fixed targets from a zeros/ones input, mirroring exercise()'s classifier check. */
+void exercise_vector(const fs::path& cfg, detector::VectorLoss loss,
+                      const std::vector<float>& target_a, const std::vector<float>& target_b) {
+    auto network = detector::Network::from_cfg(cfg.string());
+    network.initialize_random(41);
+    detector::VectorTrainer trainer(network, loss, 0.1f);
+    const std::vector<float> zeros(network.input_shape().elements(), 0.0f);
+    const std::vector<float> ones(network.input_shape().elements(), 1.0f);
+    double early = 0.0, late = 0.0;
+    for (int i = 0; i < 300; ++i) {
+        auto result = trainer.step(i % 2 ? ones : zeros, i % 2 ? target_b : target_a);
+        if (!std::isfinite(result.loss)) throw std::runtime_error("non-finite vector trainer loss");
+        if (loss == detector::VectorLoss::sigmoid_bce)
+            for (float p : result.output)
+                if (p < 0.0f || p > 1.0f) throw std::runtime_error("sigmoid_bce output outside [0,1]");
+        if (i < 20) early += result.loss;
+        if (i >= 280) late += result.loss;
+    }
+    if (!(late < early * 0.5))
+        throw std::runtime_error("vector trainer loss failed to decrease: " + cfg.string());
+    auto predicted_a = trainer.step(zeros, target_a).output;
+    auto predicted_b = trainer.step(ones, target_b).output;
+    for (std::size_t i = 0; i < target_a.size(); ++i) {
+        if (std::abs(predicted_a[i] - target_a[i]) > 0.25f || std::abs(predicted_b[i] - target_b[i]) > 0.25f)
+            throw std::runtime_error("vector trainer did not learn: " + cfg.string());
+    }
+}
+
 /** Exercises CPU/CUDA classifier training, sequence state, and checkpoint parity. */
 int main() {
     try {
@@ -258,6 +287,10 @@ int main() {
         exercise_sequence(directory / "rnn-classifier.cfg");
         exercise_sequence(directory / "lstm-classifier.cfg");
         exercise_sequence(directory / "gru-classifier.cfg");
+        exercise_vector(directory / "regressor-vector.cfg", detector::VectorLoss::mse,
+                         {0.1f, -0.5f, 0.2f}, {0.9f, 0.4f, -0.3f});
+        exercise_vector(directory / "regressor-vector.cfg", detector::VectorLoss::sigmoid_bce,
+                         {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 1.0f});
 #ifdef DETECTOR_HAS_CUDA
         exercise_cuda_training(directory / "classifier-linear.cfg");
         exercise_cuda_training(directory / "classifier-dense.cfg");

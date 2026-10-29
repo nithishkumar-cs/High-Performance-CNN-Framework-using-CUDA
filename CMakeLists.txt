@@ -7,8 +7,8 @@ option(DETECTOR_TENSORRT "Build the optional TensorRT inference backend" OFF)
 option(DETECTOR_CUDNN "Build the optional cuDNN-accelerated CUDA kernels" OFF)
 
 add_library(detector_core native/src/network.cpp native/src/image.cpp native/src/training.cpp
-  native/src/yolo_loss.cpp native/src/classifier_trainer.cpp native/src/idx.cpp native/src/metrics.cpp
-  native/src/recurrent.cpp)
+  native/src/yolo_loss.cpp native/src/classifier_trainer.cpp native/src/idx.cpp native/src/cifar.cpp
+  native/src/metrics.cpp native/src/recurrent.cpp)
 target_include_directories(detector_core PUBLIC native/include)
 target_compile_features(detector_core PUBLIC cxx_std_17)
 
@@ -78,6 +78,9 @@ target_link_libraries(cuda_classifier PRIVATE detector_core)
 add_executable(rnn_text native/src/rnn_text_main.cpp)
 target_link_libraries(rnn_text PRIVATE detector_core)
 
+add_executable(cuda_cifar native/src/cifar_main.cpp)
+target_link_libraries(cuda_cifar PRIVATE detector_core)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(detector_tests native/tests/smoke.cpp)
@@ -107,6 +110,10 @@ if(BUILD_TESTING)
   add_executable(detector_idx_tests native/tests/idx_smoke.cpp)
   target_link_libraries(detector_idx_tests PRIVATE detector_core)
   add_test(NAME detector_idx_smoke COMMAND detector_idx_tests)
+
+  add_executable(detector_cifar_tests native/tests/cifar_smoke.cpp)
+  target_link_libraries(detector_cifar_tests PRIVATE detector_core)
+  add_test(NAME detector_cifar_smoke COMMAND detector_cifar_tests)
 
   if(DETECTOR_CUDA)
     add_executable(detector_cuda_recurrent_tests native/tests/cuda_recurrent_smoke.cpp)

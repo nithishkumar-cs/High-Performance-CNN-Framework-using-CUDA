@@ -173,6 +173,11 @@ if(BUILD_TESTING)
       add_test(NAME classifier_cli_cuda
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
           $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-linear.cfg --cuda)
+      add_test(NAME segmentation_cli_cuda
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_segmentation_cli.py
+          $<TARGET_FILE:cuda_segmenter> $<TARGET_FILE:cuda_instance_segmenter>
+          ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/segmenter-vector.cfg
+          ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/instance-mask.cfg --cuda)
       add_test(NAME classifier_cli_cuda_conv
         COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
           $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-conv.cfg --cuda)

@@ -1,4 +1,5 @@
 #include "detector/classifier_trainer.hpp"
+#include "detector/cuda_classifier_trainer.hpp"
 #include "detector/network.hpp"
 #include "detector/vector_dataset.hpp"
 #include <algorithm>
@@ -6,6 +7,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -22,6 +24,7 @@ struct Options {
     float decay = 0.0f;
     unsigned seed = 2026;
     std::string initial_weights;
+    std::string backend = "cpu";
 };
 
 /** Parses the shared train/eval options after the four positional arguments. */
@@ -37,8 +40,10 @@ Options parse(int argc, char** argv) {
         else if (key == "--decay") options.decay = std::stof(value);
         else if (key == "--seed") options.seed = static_cast<unsigned>(std::stoul(value));
         else if (key == "--init") options.initial_weights = value;
+        else if (key == "--backend") options.backend = value;
         else throw std::runtime_error("unknown option: " + key);
     }
+    if (options.backend != "cpu" && options.backend != "cuda") throw std::runtime_error("backend must be cpu or cuda");
     if (options.epochs < 1 || options.limit < 0) throw std::runtime_error("invalid segmenter options");
     return options;
 }
@@ -47,7 +52,7 @@ Options parse(int argc, char** argv) {
 void usage() {
     std::cerr << "Usage:\n"
               << "  cuda_segmenter train <cfg> <output.weights> <data.vecbin>"
-                 " [--epochs N] [--lr 0.01] [--decay 0] [--seed 2026] [--limit N] [--init weights]\n"
+                 " [--backend cpu|cuda] [--epochs N] [--lr 0.01] [--decay 0] [--seed 2026] [--limit N] [--init weights]\n"
               << "  cuda_segmenter eval <cfg> <weights> <data.vecbin> [--limit N]\n"
               << "Each record: input CHW float32 pixels followed by H*W float32 integer class IDs.\n";
 }
@@ -81,18 +86,39 @@ int main(int argc, char** argv) {
                 throw std::runtime_error("refusing to overwrite existing output weights");
             if (options.initial_weights.empty()) network.initialize_random(options.seed);
             else network.load_weights(options.initial_weights);
-            detector::VectorTrainer trainer(network, detector::VectorLoss::pixel_softmax_ce,
-                                            options.learning_rate, options.decay);
+            std::unique_ptr<detector::VectorTrainer> cpu_trainer;
+#ifdef DETECTOR_HAS_CUDA
+            std::unique_ptr<detector::CudaClassificationTrainer> cuda_trainer;
+            if (options.backend == "cuda")
+                cuda_trainer = std::make_unique<detector::CudaClassificationTrainer>(
+                    network, options.learning_rate, options.decay, detector::VectorLoss::pixel_softmax_ce);
+#else
+            if (options.backend == "cuda") throw std::runtime_error("CUDA backend not built; use -DDETECTOR_CUDA=ON");
+#endif
+            if (options.backend == "cpu")
+                cpu_trainer = std::make_unique<detector::VectorTrainer>(
+                    network, detector::VectorLoss::pixel_softmax_ce, options.learning_rate, options.decay);
             std::vector<std::size_t> order(count);
             std::iota(order.begin(), order.end(), 0);
             std::mt19937 rng(options.seed);
             for (int epoch = 1; epoch <= options.epochs; ++epoch) {
                 std::shuffle(order.begin(), order.end(), rng);
                 double loss_sum = 0.0;
-                for (std::size_t i : order) loss_sum += trainer.step(data.input(i), data.target(i)).loss;
+                for (std::size_t i : order) {
+                    detector::VectorResult result;
+#ifdef DETECTOR_HAS_CUDA
+                    if (cuda_trainer) result = cuda_trainer->step_vector(data.input(i), data.target(i));
+                    else
+#endif
+                        result = cpu_trainer->step(data.input(i), data.target(i));
+                    loss_sum += result.loss;
+                }
+#ifdef DETECTOR_HAS_CUDA
+                if (cuda_trainer) cuda_trainer->sync_to_network();
+#endif
                 network.save_weights(weights);
                 std::cout << "epoch=" << epoch << " samples=" << count
-                          << " mean_loss=" << std::fixed << std::setprecision(6) << loss_sum / count
+                          << " backend=" << options.backend << " mean_loss=" << std::fixed << std::setprecision(6) << loss_sum / count
                           << " checkpoint=" << weights << '\n';
             }
         } else {

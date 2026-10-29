@@ -27,7 +27,8 @@ def write_records(path: pathlib.Path, records: list[list[float]]) -> None:
 
 def main() -> None:
     """Train both heads and require their held-out synthetic metrics to converge."""
-    segmenter, instance_segmenter, semantic_cfg, instance_cfg = sys.argv[1:]
+    segmenter, instance_segmenter, semantic_cfg, instance_cfg = sys.argv[1:5]
+    backend = ["--backend", "cuda"] if "--cuda" in sys.argv[5:] else []
     segmenter = str(pathlib.Path(segmenter).resolve())
     instance_segmenter = str(pathlib.Path(instance_segmenter).resolve())
     semantic_cfg = str(pathlib.Path(semantic_cfg).resolve())
@@ -40,7 +41,7 @@ def main() -> None:
         write_records(semantic_data, [semantic_input + semantic_target] * 8)
         semantic_weights = root / "semantic.weights"
         run(segmenter, "train", semantic_cfg, semantic_weights, semantic_data,
-            "--epochs", 30, "--lr", 0.2)
+            "--epochs", 30, "--lr", 0.2, *backend)
         semantic_eval = run(segmenter, "eval", semantic_cfg, semantic_weights, semantic_data)
         if "pixel_accuracy=1.000000" not in semantic_eval or "mean_iou=1.000000" not in semantic_eval:
             raise AssertionError(semantic_eval)
@@ -56,7 +57,7 @@ def main() -> None:
         write_records(instance_data, [input_chw + red] * 8)
         instance_weights = root / "instance.weights"
         run(instance_segmenter, "train", instance_cfg, instance_weights, instance_data,
-            "--epochs", 40, "--lr", 0.2)
+            "--epochs", 40, "--lr", 0.2, *backend)
         instance_eval = run(instance_segmenter, "eval", instance_cfg, instance_weights, instance_data)
         if "mean_mask_iou=1.000000" not in instance_eval:
             raise AssertionError(instance_eval)

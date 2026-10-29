@@ -316,6 +316,41 @@ void exercise_segmentation(const fs::path& cfg) {
         throw std::runtime_error("ignored segmentation pixels affected training");
 }
 
+#ifdef DETECTOR_HAS_CUDA
+/** Checks CPU and CUDA vector-loss trainers produce identical losses, outputs, and weights over several steps. */
+void exercise_cuda_vector_parity(const fs::path& cfg, detector::VectorLoss loss,
+                                 const std::vector<std::vector<float>>& inputs,
+                                 const std::vector<std::vector<float>>& targets) {
+    auto cpu = detector::Network::from_cfg(cfg.string());
+    auto cuda = detector::Network::from_cfg(cfg.string());
+    cpu.initialize_random(5);
+    cuda.initialize_random(5);
+    detector::VectorTrainer cpu_trainer(cpu, loss, 0.05f);
+    detector::CudaClassificationTrainer cuda_trainer(cuda, 0.05f, 0.0f, loss);
+    for (int step = 0; step < 6; ++step)
+        for (std::size_t i = 0; i < inputs.size(); ++i) {
+            auto a = cpu_trainer.step(inputs[i], targets[i]);
+            auto b = cuda_trainer.step_vector(inputs[i], targets[i]);
+            if (std::abs(a.loss - b.loss) > 1e-5f || a.output.size() != b.output.size())
+                throw std::runtime_error("CPU/CUDA vector trainer loss mismatch: " + cfg.string());
+            for (std::size_t j = 0; j < a.output.size(); ++j)
+                if (std::abs(a.output[j] - b.output[j]) > 1e-5f)
+                    throw std::runtime_error("CPU/CUDA vector trainer output mismatch: " + cfg.string());
+        }
+    cuda_trainer.sync_to_network();
+    for (std::size_t index = 0; index < cpu.layers().size(); ++index) {
+        const auto& a = cpu.layers()[index];
+        const auto& b = cuda.layers()[index];
+        for (std::size_t j = 0; j < a.weights.size(); ++j)
+            if (std::abs(a.weights[j] - b.weights[j]) > 1e-5f)
+                throw std::runtime_error("CPU/CUDA vector trainer weight mismatch: " + cfg.string());
+        for (std::size_t j = 0; j < a.biases.size(); ++j)
+            if (std::abs(a.biases[j] - b.biases[j]) > 1e-5f)
+                throw std::runtime_error("CPU/CUDA vector trainer bias mismatch: " + cfg.string());
+    }
+}
+#endif
+
 /** Exercises CPU/CUDA classifier training, sequence state, and checkpoint parity. */
 int main() {
     try {
@@ -352,6 +387,13 @@ int main() {
         exercise_cuda_sequence_parity(directory / "rnn-normalization-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-local-classifier.cfg");
         exercise_cuda_sequence_parity(directory / "rnn-deconv-classifier.cfg");
+        exercise_cuda_vector_parity(directory / "segmenter-vector.cfg", detector::VectorLoss::pixel_softmax_ce,
+                                    {{1.0f, 0.0f, 1.0f, 0.0f}, {0.0f, 1.0f, 0.0f, 1.0f}},
+                                    {{1.0f, 0.0f, 1.0f, 0.0f}, {0.0f, -1.0f, 0.0f, 1.0f}});
+        exercise_cuda_vector_parity(directory / "regressor-vector.cfg", detector::VectorLoss::mse,
+                                    {{0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f}}, {{0.9f, 0.4f, -0.3f}});
+        exercise_cuda_vector_parity(directory / "regressor-vector.cfg", detector::VectorLoss::sigmoid_bce,
+                                    {{0.0f, 0.1f, 0.2f, 0.3f, 0.4f, 0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1.0f, 0.9f, 0.8f, 0.7f, 0.6f, 0.5f}}, {{1.0f, 0.0f, 1.0f}});
 #endif
         return 0;
     } catch (const std::exception& error) {

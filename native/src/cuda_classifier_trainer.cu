@@ -282,16 +282,25 @@ struct CudaClassificationTrainer::Impl {
     std::vector<float*> biases;
     std::vector<int*> max_index;
     int recurrent_index = -1;
+    bool pixel_mode;  // True for a VectorLoss head without a final [softmax] (step_vector()).
+    VectorLoss vector_loss = VectorLoss::mse;
+    std::size_t trainable_count;  // Layers before the softmax; all layers in pixel mode.
 
     /** Allocates graph buffers and uploads learnable nonrecurrent parameters. */
-    Impl(Network& net, float lr, float decay)
-        : network(net), learning_rate(lr), weight_decay(decay) {
+    Impl(Network& net, float lr, float decay, std::optional<VectorLoss> loss)
+        : network(net), learning_rate(lr), weight_decay(decay), pixel_mode(loss.has_value()),
+          vector_loss(loss.value_or(VectorLoss::mse)),
+          trainable_count(net.layers_.size() - (loss.has_value() ? 0 : 1)) {
         if (!std::isfinite(lr) || lr <= 0 || !std::isfinite(decay) || decay < 0)
             throw std::runtime_error("invalid CUDA SGD parameters");
         const auto& layers = net.layers_;
-        if (layers.size() < 2 || layers.back().kind != Kind::softmax)
-            throw std::runtime_error("CUDA classifier requires dense layers and final [softmax]");
-        for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
+        if (pixel_mode ? layers.empty() || layers.back().kind == Kind::softmax ||
+                             (vector_loss == VectorLoss::pixel_softmax_ce && layers.back().output.c < 2)
+                       : layers.size() < 2 || layers.back().kind != Kind::softmax)
+            throw std::runtime_error(pixel_mode ?
+                "CUDA vector trainer requires a final non-softmax layer (>=2 channels for pixel softmax)" :
+                "CUDA classifier requires dense layers and final [softmax]");
+        for (std::size_t i = 0; i < trainable_count; ++i) {
             if (layers[i].kind == Kind::rnn || layers[i].kind == Kind::lstm || layers[i].kind == Kind::gru) {
                 if (recurrent_index >= 0) throw std::runtime_error("CUDA classifier supports at most one recurrent layer");
                 recurrent_index = static_cast<int>(i);
@@ -364,6 +373,7 @@ struct CudaClassificationTrainer::Impl {
     /** Runs one SGD step for a graph with no recurrent layer. */
     ClassificationResult step(const std::vector<float>& host_input, int class_id) {
         const auto& layers = network.layers_;
+        if (pixel_mode) throw std::runtime_error("vector-loss trainer requires step_vector()");
         if (recurrent_index >= 0)
             throw std::runtime_error("cfg has a recurrent layer; use train_sequence() instead of step()");
         if (host_input.size() != network.input_.elements())
@@ -371,10 +381,32 @@ struct CudaClassificationTrainer::Impl {
         int classes = layers.back().output.c;
         if (class_id < 0 || class_id >= classes)
             throw std::runtime_error("CUDA classifier target outside class range");
+        forward(host_input);
+        softmax_vector<<<1, 1>>>(output[layers.size() - 2], output.back(), classes);
+        launch_check();
+        std::vector<float> probabilities(static_cast<std::size_t>(classes));
+        check(cudaMemcpy(probabilities.data(), output.back(), probabilities.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost), "cudaMemcpy classifier probabilities");
+        float loss = -std::log(std::max(probabilities[static_cast<std::size_t>(class_id)],
+                                         std::numeric_limits<float>::min()));
+        bool correct = static_cast<int>(std::max_element(probabilities.begin(), probabilities.end()) -
+                                        probabilities.begin()) == class_id;
+        probabilities[static_cast<std::size_t>(class_id)] -= 1.0f;
+        check(cudaMemcpy(gradient[layers.size() - 2], probabilities.data(),
+                         probabilities.size() * sizeof(float), cudaMemcpyHostToDevice),
+              "cudaMemcpy classifier gradient");
+        backward();
+        if (!std::isfinite(loss)) throw std::runtime_error("non-finite CUDA classification loss");
+        return {loss, correct};
+    }
+
+    /** Uploads one sample and runs every pre-softmax layer forward on the GPU. */
+    void forward(const std::vector<float>& host_input) {
+        const auto& layers = network.layers_;
         check(cudaMemcpy(input, host_input.data(), host_input.size() * sizeof(float),
                          cudaMemcpyHostToDevice), "cudaMemcpy classifier input");
         constexpr int threads = 256;
-        for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
+        for (std::size_t i = 0; i < trainable_count; ++i) {
             const auto& layer = layers[i];
             const float* previous = i ? output[i - 1] : input;
             if (layer.kind == Kind::connected)
@@ -414,21 +446,13 @@ struct CudaClassificationTrainer::Impl {
                     layer.output.h, layer.output.w, layer.size, layer.stride);
             launch_check();
         }
-        softmax_vector<<<1, 1>>>(output[layers.size() - 2], output.back(), classes);
-        launch_check();
-        std::vector<float> probabilities(static_cast<std::size_t>(classes));
-        check(cudaMemcpy(probabilities.data(), output.back(), probabilities.size() * sizeof(float),
-                         cudaMemcpyDeviceToHost), "cudaMemcpy classifier probabilities");
-        float loss = -std::log(std::max(probabilities[static_cast<std::size_t>(class_id)],
-                                         std::numeric_limits<float>::min()));
-        bool correct = static_cast<int>(std::max_element(probabilities.begin(), probabilities.end()) -
-                                        probabilities.begin()) == class_id;
-        probabilities[static_cast<std::size_t>(class_id)] -= 1.0f;
-        check(cudaMemcpy(gradient[layers.size() - 2], probabilities.data(),
-                         probabilities.size() * sizeof(float), cudaMemcpyHostToDevice),
-              "cudaMemcpy classifier gradient");
+    }
 
-        for (std::size_t reverse = layers.size() - 1; reverse-- > 0;) {
+    /** Backpropagates gradient[trainable_count - 1] through every trainable layer with in-place SGD. */
+    void backward() {
+        const auto& layers = network.layers_;
+        constexpr int threads = 256;
+        for (std::size_t reverse = trainable_count; reverse-- > 0;) {
             const auto& layer = layers[reverse];
             int outputs = layer.output.c;
             int inputs = static_cast<int>(layer.input.elements());
@@ -565,8 +589,83 @@ struct CudaClassificationTrainer::Impl {
             }
         }
         check(cudaDeviceSynchronize(), "cudaDeviceSynchronize classifier SGD");
-        if (!std::isfinite(loss)) throw std::runtime_error("non-finite CUDA classification loss");
-        return {loss, correct};
+    }
+
+    /** One SGD step against the final layer's raw output with mse, sigmoid-BCE, or pixelwise
+     *  softmax cross-entropy (target -1 ignores a pixel); loss math matches VectorTrainer::step. */
+    VectorResult step_vector(const std::vector<float>& host_input, const std::vector<float>& targets) {
+        const auto& layers = network.layers_;
+        if (!pixel_mode) throw std::runtime_error("trainer was not built with a vector loss");
+        if (host_input.size() != network.input_.elements())
+            throw std::runtime_error("CUDA vector trainer input shape mismatch");
+        const auto shape = layers.back().output;
+        const std::size_t pixels = static_cast<std::size_t>(shape.h) * shape.w;
+        const bool softmax_loss = vector_loss == VectorLoss::pixel_softmax_ce;
+        if (targets.size() != (softmax_loss ? pixels : shape.elements()))
+            throw std::runtime_error("CUDA vector trainer target shape mismatch");
+        std::size_t valid = softmax_loss ? 0 : shape.elements();
+        if (softmax_loss) {
+            for (float target : targets) {
+                if (!std::isfinite(target) || (target != -1.0f &&
+                    (target < 0.0f || target >= shape.c || std::floor(target) != target)))
+                    throw std::runtime_error("pixel_softmax_ce targets must be integer class IDs or -1 for ignore");
+                if (target != -1.0f) ++valid;
+            }
+            if (!valid) throw std::runtime_error("pixel_softmax_ce requires at least one labeled pixel");
+        }
+        forward(host_input);
+        std::vector<float> logits(shape.elements());
+        check(cudaMemcpy(logits.data(), output.back(), logits.size() * sizeof(float),
+                         cudaMemcpyDeviceToHost), "cudaMemcpy vector logits");
+        std::vector<float> reported(logits.size()), grad(logits.size(), 0.0f);
+        const float inv = 1.0f / static_cast<float>(valid);
+        double loss = 0.0;
+        if (vector_loss == VectorLoss::mse) {
+            for (std::size_t j = 0; j < logits.size(); ++j) {
+                const float diff = logits[j] - targets[j];
+                loss += 0.5f * diff * diff;
+                grad[j] = diff * inv;
+            }
+            reported = logits;
+        } else if (vector_loss == VectorLoss::sigmoid_bce) {
+            for (std::size_t j = 0; j < logits.size(); ++j) {
+                if (targets[j] < 0.0f || targets[j] > 1.0f)
+                    throw std::runtime_error("sigmoid_bce targets must be in [0,1]");
+                const float p = 1.0f / (1.0f + std::exp(-logits[j]));
+                const float clamped = std::min(std::max(p, std::numeric_limits<float>::min()), 1.0f - 1e-7f);
+                loss += -(targets[j] * std::log(clamped) + (1.0f - targets[j]) * std::log(1.0f - clamped));
+                grad[j] = (p - targets[j]) * inv;
+                reported[j] = p;
+            }
+        } else {
+            for (std::size_t pixel = 0; pixel < pixels; ++pixel) {
+                const float target = targets[pixel];
+                const bool ignored = target == -1.0f;
+                const std::size_t truth = ignored ? 0 : static_cast<std::size_t>(target);
+                float maximum = -std::numeric_limits<float>::infinity();
+                for (int c = 0; c < shape.c; ++c)
+                    maximum = std::max(maximum, logits[static_cast<std::size_t>(c) * pixels + pixel]);
+                double sum = 0.0;
+                for (int c = 0; c < shape.c; ++c) {
+                    const std::size_t pos = static_cast<std::size_t>(c) * pixels + pixel;
+                    reported[pos] = std::exp(logits[pos] - maximum);
+                    sum += reported[pos];
+                }
+                if (!ignored) loss += std::log(sum) + maximum - logits[truth * pixels + pixel];
+                for (int c = 0; c < shape.c; ++c) {
+                    const std::size_t pos = static_cast<std::size_t>(c) * pixels + pixel;
+                    reported[pos] = static_cast<float>(reported[pos] / sum);
+                    if (!ignored)
+                        grad[pos] = (reported[pos] - (static_cast<std::size_t>(c) == truth ? 1.0f : 0.0f)) * inv;
+                }
+            }
+        }
+        check(cudaMemcpy(gradient[trainable_count - 1], grad.data(), grad.size() * sizeof(float),
+                         cudaMemcpyHostToDevice), "cudaMemcpy vector gradient");
+        backward();
+        const float mean_loss = static_cast<float>(loss * inv);
+        if (!std::isfinite(mean_loss)) throw std::runtime_error("non-finite CUDA vector trainer loss");
+        return {mean_loss, std::move(reported)};
     }
 
     /** Trains one time chunk; nonrecurrent layers remain on CUDA and the CUDA recurrent
@@ -850,7 +949,7 @@ struct CudaClassificationTrainer::Impl {
     /** Downloads learned nonrecurrent parameters for checkpointing or CPU inference. */
     void sync_to_network() {
         auto& layers = network.layers_;
-        for (std::size_t i = 0; i + 1 < layers.size(); ++i) {
+        for (std::size_t i = 0; i < trainable_count; ++i) {
             auto& layer = layers[i];
             if (layer.kind == Kind::maxpool || layer.kind == Kind::avgpool || layer.kind == Kind::l2norm ||
                 layer.kind == Kind::normalization ||
@@ -865,11 +964,16 @@ struct CudaClassificationTrainer::Impl {
     }
 };
 
-CudaClassificationTrainer::CudaClassificationTrainer(Network& network, float learning_rate, float weight_decay)
-    : impl_(std::make_unique<Impl>(network, learning_rate, weight_decay)) {}
+CudaClassificationTrainer::CudaClassificationTrainer(Network& network, float learning_rate,
+                                                     float weight_decay, std::optional<VectorLoss> vector_loss)
+    : impl_(std::make_unique<Impl>(network, learning_rate, weight_decay, vector_loss)) {}
 CudaClassificationTrainer::~CudaClassificationTrainer() = default;
 ClassificationResult CudaClassificationTrainer::step(const std::vector<float>& input, int class_id) {
     return impl_->step(input, class_id);
+}
+VectorResult CudaClassificationTrainer::step_vector(const std::vector<float>& input,
+                                                    const std::vector<float>& targets) {
+    return impl_->step_vector(input, targets);
 }
 std::vector<ClassificationResult> CudaClassificationTrainer::train_sequence(
         const std::vector<std::vector<float>>& inputs, const std::vector<int>& class_ids) {

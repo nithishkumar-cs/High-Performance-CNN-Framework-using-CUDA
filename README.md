@@ -1,4 +1,4 @@
-# CUDA Neural Network Framework
+# native-darknet-cuda
 
 An independently written C++/CUDA neural-network framework inspired by [pjreddie/darknet](https://github.com/pjreddie/darknet). It is not a fork and does not contain Darknet source. `native/` contains the configurable framework; the original fixed-shape MNIST CUDA CNN remains in the repository. Training runs on the laptop GPU and Jetson is an inference target. See [current support and limits](docs/framework-status.md).
 
@@ -41,5 +41,21 @@ Train future models on the laptop GPU. The [deeper CNN example](native/examples/
 For TensorRT, export with `native/tools/export_darknet_onnx.py`, build the engine on the Jetson, and configure with `-DDETECTOR_TENSORRT=ON`; see the [tested commands and results](docs/onnx-tensorrt.md). Full YOLOv3 is not required for this path.
 
 Detector training accepts `--backend cuda --gpus 0,1 --batch N` on a host with two GPUs; `N` is the total minibatch size. The default is GPU 0. The code synchronizes learned weights, momentum and batch-normalization running state after each global step. This laptop has one RTX 3070 Ti, so two-device execution and throughput remain unmeasured. Its one-GPU path and synchronization math have CUDA regression tests.
+
+## Segmentation examples
+
+`cuda_segmenter` trains a semantic head with pixelwise softmax cross-entropy and reports pixel accuracy and mean class IoU. `cuda_instance_segmenter` trains a class-agnostic binary mask head from object crops, then pairs that head with any supported detector at inference: one separate mask is predicted per detected box and written as a full-image PGM with an `instances.tsv` index. The two heads train with the CPU `VectorTrainer`; mask inference supports CPU and native CUDA. These example pipelines pass synthetic convergence, CPU/CUDA mask inference, and one-record VOC training smoke checks; no full VOC segmentation training or held-out segmentation score is available yet. The instance stage is trained separately from the detector and its `eval` command measures mask IoU on ground-truth crops, not end-to-end instance AP.
+
+For VOC2007 segmentation data already present locally, generate manifests and fixed-size float32 records (Pillow and NumPy required for packing):
+
+```sh
+python native/tools/prepare_voc_segmentation.py data/voc2007/VOCdevkit/VOC2007 train runs/voc-seg
+python native/tools/pack_segmentation.py semantic runs/voc-seg/train-semantic.tsv runs/voc-seg/train-semantic-32.vecbin --width 32 --height 32 --classes 21 --ignore-value 255
+python native/tools/pack_segmentation.py instance runs/voc-seg/train-instance.tsv runs/voc-seg/train-instance-32.vecbin --width 32 --height 32
+./build/cuda_segmenter train native/examples/segmenter.cfg runs/voc-seg/semantic.weights runs/voc-seg/train-semantic-32.vecbin --epochs 1 --lr 0.01
+./build/cuda_instance_segmenter train native/examples/instance-mask.cfg runs/voc-seg/mask.weights runs/voc-seg/train-instance-32.vecbin --epochs 1 --lr 0.01
+```
+
+The manifests use tab-separated image/mask paths; instance rows also hold integer box bounds and the object's palette ID. Semantic records append one class ID per output pixel (`-1` ignores a void pixel); instance records append a binary mask. The 32×32 cfgs are small examples, not tuned VOC models. Use the separate `val` split and `eval` commands for a real held-out measurement. Prediction takes detector cfg/weights, mask cfg/weights, an image and an empty output directory; run `cuda_instance_segmenter` with no arguments for its exact command syntax.
 
 Do not pair 80-class COCO weights with the 20-class VOC config. The included `native/tests/voc-smoke.cfg` is **not** YOLOv3-tiny. See [current framework status](docs/framework-status.md) for the implementation's limits.

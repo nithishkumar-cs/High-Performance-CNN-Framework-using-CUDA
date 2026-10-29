@@ -277,6 +277,45 @@ void exercise_vector(const fs::path& cfg, detector::VectorLoss loss,
     }
 }
 
+/** Checks exact pixelwise CE gradients and learning on a two-class 1x1 segmentation model. */
+void exercise_segmentation(const fs::path& cfg) {
+    auto network = detector::Network::from_cfg(cfg.string());
+    network.initialize_random(12);
+    auto& head = network.layer(0);
+    std::fill(head.weights.begin(), head.weights.end(), 0.0f);
+    std::fill(head.biases.begin(), head.biases.end(), 0.0f);
+    detector::VectorTrainer trainer(network, detector::VectorLoss::pixel_softmax_ce, 0.2f);
+    const std::vector<float> input{1.0f, 0.0f, 1.0f, 0.0f};
+    const std::vector<float> target{1.0f, 0.0f, 1.0f, 0.0f};
+    auto first = trainer.step(input, target);
+    if (std::abs(first.loss - std::log(2.0f)) > 1e-6f || first.output.size() != 8 ||
+        std::abs(head.weights[0] + 0.05f) > 1e-6f ||
+        std::abs(head.weights[1] - 0.05f) > 1e-6f)
+        throw std::runtime_error("pixelwise CE loss or gradient mismatch");
+    for (float probability : first.output)
+        if (std::abs(probability - 0.5f) > 1e-6f)
+            throw std::runtime_error("pixelwise CE probability mismatch");
+    float last = first.loss;
+    for (int i = 0; i < 100; ++i) last = trainer.step(input, target).loss;
+    if (!(last < 0.2f)) throw std::runtime_error("segmentation loss did not converge");
+    try {
+        trainer.step(input, {1.0f, 0.0f, 2.0f, 0.0f});
+        throw std::runtime_error("out-of-range segmentation target accepted");
+    } catch (const std::runtime_error& error) {
+        if (std::string(error.what()) != "pixel_softmax_ce targets must be integer class IDs or -1 for ignore") throw;
+    }
+    auto before_ignore = head.weights;
+    try {
+        trainer.step(input, {-1.0f, -1.0f, -1.0f, -1.0f});
+        throw std::runtime_error("all-ignored segmentation target accepted");
+    } catch (const std::runtime_error& error) {
+        if (std::string(error.what()) != "pixel_softmax_ce requires at least one labeled pixel") throw;
+    }
+    if (head.weights != before_ignore ||
+        !std::isfinite(trainer.step(input, {1.0f, -1.0f, 1.0f, -1.0f}).loss))
+        throw std::runtime_error("ignored segmentation pixels affected training");
+}
+
 /** Exercises CPU/CUDA classifier training, sequence state, and checkpoint parity. */
 int main() {
     try {
@@ -290,7 +329,8 @@ int main() {
         exercise_vector(directory / "regressor-vector.cfg", detector::VectorLoss::mse,
                          {0.1f, -0.5f, 0.2f}, {0.9f, 0.4f, -0.3f});
         exercise_vector(directory / "regressor-vector.cfg", detector::VectorLoss::sigmoid_bce,
-                         {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 1.0f});
+                          {0.0f, 1.0f, 0.0f}, {1.0f, 0.0f, 1.0f});
+        exercise_segmentation(directory / "segmenter-vector.cfg");
 #ifdef DETECTOR_HAS_CUDA
         exercise_cuda_training(directory / "classifier-linear.cfg");
         exercise_cuda_training(directory / "classifier-dense.cfg");

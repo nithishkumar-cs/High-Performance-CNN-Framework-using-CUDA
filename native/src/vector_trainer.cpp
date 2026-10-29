@@ -30,14 +30,20 @@ VectorTrainer::VectorTrainer(Network& network, VectorLoss loss, float learning_r
             layer.kind != Kind::connected && layer.kind != Kind::l2norm && layer.kind != Kind::normalization)
             throw std::runtime_error("unsupported layer in vector trainer");
     }
+    if (loss_ == VectorLoss::pixel_softmax_ce && layers.back().output.c < 2)
+        throw std::runtime_error("pixel_softmax_ce requires at least two output channels");
 }
 
-/** Applies one sample's MSE or multi-label sigmoid-BCE SGD update. */
+/** Applies one sample's MSE, sigmoid-BCE, or pixelwise softmax-CE SGD update. */
 VectorResult VectorTrainer::step(const std::vector<float>& input, const std::vector<float>& targets) {
     if (input.size() != network_.input_.elements())
         throw std::runtime_error("vector trainer input shape mismatch");
     auto& layers = network_.layers_;
-    if (targets.size() != layers.back().output.elements())
+    const auto final_shape = layers.back().output;
+    const std::size_t pixels = static_cast<std::size_t>(final_shape.h) * final_shape.w;
+    const std::size_t expected_targets = loss_ == VectorLoss::pixel_softmax_ce ?
+        pixels : final_shape.elements();
+    if (targets.size() != expected_targets)
         throw std::runtime_error("vector trainer target shape mismatch");
 
     std::vector<std::vector<float>> output(layers.size());
@@ -151,6 +157,7 @@ VectorResult VectorTrainer::step(const std::vector<float>& input, const std::vec
     const std::size_t n = raw.size();
     const float inv_n = 1.0f / static_cast<float>(n);
     float loss = 0.0f;
+    std::size_t valid_pixels = pixels;
     std::vector<float> reported(n);
     auto& output_gradient = gradient.back();
     if (loss_ == VectorLoss::mse) {
@@ -160,7 +167,7 @@ VectorResult VectorTrainer::step(const std::vector<float>& input, const std::vec
             output_gradient[j] = diff * inv_n;
         }
         reported = raw;
-    } else {  // sigmoid_bce
+    } else if (loss_ == VectorLoss::sigmoid_bce) {
         for (std::size_t j = 0; j < n; ++j) {
             if (targets[j] < 0.0f || targets[j] > 1.0f)
                 throw std::runtime_error("sigmoid_bce targets must be in [0,1]");
@@ -170,8 +177,42 @@ VectorResult VectorTrainer::step(const std::vector<float>& input, const std::vec
             output_gradient[j] = (p - targets[j]) * inv_n;
             reported[j] = p;
         }
+    } else {  // pixel_softmax_ce; targets are integer class IDs in row-major HxW order.
+        valid_pixels = 0;
+        for (float target : targets) {
+            if (!std::isfinite(target) || (target != -1.0f &&
+                (target < 0.0f || target >= final_shape.c || std::floor(target) != target)))
+                throw std::runtime_error("pixel_softmax_ce targets must be integer class IDs or -1 for ignore");
+            if (target != -1.0f) ++valid_pixels;
+        }
+        if (!valid_pixels) throw std::runtime_error("pixel_softmax_ce requires at least one labeled pixel");
+        const float inv_pixels = 1.0f / static_cast<float>(valid_pixels);
+        for (std::size_t pixel = 0; pixel < pixels; ++pixel) {
+            const float target = targets[pixel];
+            const bool ignored = target == -1.0f;
+            const std::size_t truth = ignored ? 0 : static_cast<std::size_t>(target);
+            float maximum = -std::numeric_limits<float>::infinity();
+            for (int c = 0; c < final_shape.c; ++c)
+                maximum = std::max(maximum, raw[static_cast<std::size_t>(c) * pixels + pixel]);
+            double sum = 0.0;
+            for (int c = 0; c < final_shape.c; ++c) {
+                const std::size_t pos = static_cast<std::size_t>(c) * pixels + pixel;
+                const float value = std::exp(raw[pos] - maximum);
+                reported[pos] = value;
+                sum += value;
+            }
+            if (!ignored)
+                loss += static_cast<float>(std::log(sum) + maximum - raw[truth * pixels + pixel]);
+            for (int c = 0; c < final_shape.c; ++c) {
+                const std::size_t pos = static_cast<std::size_t>(c) * pixels + pixel;
+                reported[pos] = static_cast<float>(reported[pos] / sum);
+                output_gradient[pos] = ignored ? 0.0f :
+                    (reported[pos] - (static_cast<std::size_t>(c) == truth ? 1.0f : 0.0f)) * inv_pixels;
+            }
+        }
     }
-    loss *= inv_n;
+    if (loss_ != VectorLoss::pixel_softmax_ce) loss *= inv_n;
+    else loss /= static_cast<float>(valid_pixels);
     if (!std::isfinite(loss)) throw std::runtime_error("non-finite vector trainer loss");
 
     for (std::size_t reverse = layers.size(); reverse-- > 0;) {

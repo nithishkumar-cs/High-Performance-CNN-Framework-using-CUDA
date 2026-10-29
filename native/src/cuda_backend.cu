@@ -206,7 +206,7 @@ struct CudaSession::Impl {
         }
     }
 
-    /** Runs one input through the graph and downloads detection/classification heads. */
+    /** Runs one input through the graph and downloads detection, classification, or plain terminal heads. */
     std::vector<Head> forward(const std::vector<float>& host_input) {
         if (host_input.size() != network.input_shape().elements()) throw std::runtime_error("input does not match cfg shape");
         check(cudaMemcpy(input, host_input.data(), host_input.size() * sizeof(float), cudaMemcpyHostToDevice),
@@ -316,6 +316,19 @@ struct CudaSession::Impl {
                 head.values.resize(layer.output.elements());
                 check(cudaMemcpy(head.values.data(), result, head.values.size() * sizeof(float), cudaMemcpyDeviceToHost),
                       "cudaMemcpy YOLO output");
+                heads.push_back(std::move(head));
+            }
+        }
+        if (!layers.empty() && (heads.empty() || heads.back().layer != layers.size() - 1)) {
+            const Kind kind = layers.back().kind;
+            if (kind == Kind::connected || kind == Kind::convolutional || kind == Kind::local ||
+                kind == Kind::deconvolutional || kind == Kind::avgpool || kind == Kind::l2norm ||
+                kind == Kind::normalization) {
+                Head head;
+                head.layer = layers.size() - 1;
+                head.values.resize(layers.back().output.elements());
+                check(cudaMemcpy(head.values.data(), output.back(), head.values.size() * sizeof(float),
+                                 cudaMemcpyDeviceToHost), "cudaMemcpy plain terminal output");
                 heads.push_back(std::move(head));
             }
         }

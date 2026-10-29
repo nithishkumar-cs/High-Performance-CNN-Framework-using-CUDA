@@ -40,20 +40,22 @@ private:
 enum class VectorLoss {
     mse,          // Darknet's regressor.c: 0.5*mean((output-target)^2) over the output vector.
     sigmoid_bce,  // Darknet's tag.c: independent per-output sigmoid + binary cross-entropy -
-                  // multi-label classification, unlike [softmax]'s single mutually-exclusive class.
+                   // multi-label classification, unlike [softmax]'s single mutually-exclusive class.
+    pixel_softmax_ce,  // Per-pixel classes in CxHxW logits; target -1 ignores a pixel.
 };
 
 struct VectorResult {
     float loss = 0;
-    // mse: the raw network output. sigmoid_bce: sigmoid(raw output) per element, i.e. each
-    // output's predicted probability - what a caller thresholds at 0.5 for a tag decision.
+    // mse: raw output; sigmoid_bce: independent probabilities; pixel_softmax_ce: CxHxW
+    // per-pixel class probabilities in the same layout as the final layer.
     std::vector<float> output;
 };
 
 // Reference SGD trainer for a feedforward (no softmax, no recurrent layer) [convolutional]/
 // [maxpool]/[connected]/etc. graph against a per-output-element target vector, instead of
 // ClassificationTrainer's single mutually-exclusive class_id - Darknet's regressor.c (mse) and
-// tag.c (sigmoid_bce, multi-label) examples. Shares every layer kind's forward/backward math
+// tag.c (sigmoid_bce, multi-label) and semantic segmentation (pixel_softmax_ce) examples.
+// Shares every layer kind's forward/backward math
 // with ClassificationTrainer (duplicated here, not refactored into a shared helper, to avoid
 // risking regressions in step()'s already parity-tested code path for this additive feature).
 class VectorTrainer {

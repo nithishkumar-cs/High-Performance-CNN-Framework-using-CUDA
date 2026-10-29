@@ -9,6 +9,7 @@ option(DETECTOR_CUDNN "Build the optional cuDNN-accelerated CUDA kernels" OFF)
 add_library(detector_core native/src/network.cpp native/src/image.cpp native/src/training.cpp
   native/src/yolo_loss.cpp native/src/classifier_trainer.cpp native/src/vector_trainer.cpp
   native/src/idx.cpp native/src/cifar.cpp native/src/vector_dataset.cpp native/src/metrics.cpp
+  native/src/instance_segmentation.cpp
   native/src/recurrent.cpp)
 target_include_directories(detector_core PUBLIC native/include)
 target_compile_features(detector_core PUBLIC cxx_std_17)
@@ -88,6 +89,12 @@ target_link_libraries(cuda_regressor PRIVATE detector_core)
 add_executable(cuda_tag native/src/tag_main.cpp)
 target_link_libraries(cuda_tag PRIVATE detector_core)
 
+add_executable(cuda_segmenter native/src/segmenter_main.cpp)
+target_link_libraries(cuda_segmenter PRIVATE detector_core)
+
+add_executable(cuda_instance_segmenter native/src/instance_segmenter_main.cpp)
+target_link_libraries(cuda_instance_segmenter PRIVATE detector_core)
+
 include(CTest)
 if(BUILD_TESTING)
   add_executable(detector_tests native/tests/smoke.cpp)
@@ -126,6 +133,10 @@ if(BUILD_TESTING)
   target_link_libraries(detector_vector_dataset_tests PRIVATE detector_core)
   add_test(NAME detector_vector_dataset_smoke COMMAND detector_vector_dataset_tests)
 
+  add_executable(detector_instance_segmentation_tests native/tests/instance_segmentation_smoke.cpp)
+  target_link_libraries(detector_instance_segmentation_tests PRIVATE detector_core)
+  add_test(NAME detector_instance_segmentation_smoke COMMAND detector_instance_segmentation_tests)
+
   if(DETECTOR_CUDA)
     add_executable(detector_cuda_recurrent_tests native/tests/cuda_recurrent_smoke.cpp)
     target_link_libraries(detector_cuda_recurrent_tests PRIVATE detector_core)
@@ -144,6 +155,11 @@ if(BUILD_TESTING)
 
   find_package(Python3 COMPONENTS Interpreter QUIET)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME segmentation_cli_cpu
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_segmentation_cli.py
+        $<TARGET_FILE:cuda_segmenter> $<TARGET_FILE:cuda_instance_segmenter>
+        ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/segmenter-vector.cfg
+        ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/instance-mask.cfg)
     add_test(NAME classifier_cli_cpu
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_classifier_cli.py
         $<TARGET_FILE:cuda_classifier> ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/classifier-linear.cfg)
@@ -170,6 +186,15 @@ if(BUILD_TESTING)
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_prepare_darknet_voc.py)
     add_test(NAME darknet_checkpoint_monitor
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_monitor_darknet_run.py)
+    execute_process(
+      COMMAND ${Python3_EXECUTABLE} -c "import numpy, PIL"
+      RESULT_VARIABLE SEGMENTATION_PACK_IMPORT_RESULT
+      OUTPUT_QUIET ERROR_QUIET)
+    if(SEGMENTATION_PACK_IMPORT_RESULT EQUAL 0)
+      add_test(NAME segmentation_dataset_pack
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/native/tests/test_pack_segmentation.py
+          ${CMAKE_CURRENT_SOURCE_DIR}/native/tools/pack_segmentation.py)
+    endif()
     execute_process(
       COMMAND ${Python3_EXECUTABLE} -c "import numpy, onnx, onnxruntime"
       RESULT_VARIABLE ONNX_TEST_IMPORT_RESULT

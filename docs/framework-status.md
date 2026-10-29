@@ -9,6 +9,7 @@ This project is an independent C++/CUDA neural-network framework inspired by [pj
 - Native CUDA detector training includes anchor assignment and YOLO/region loss, crop/flip/HSV augmentation, multiscale resizing, burn-in/step-decay scheduling, SGD momentum and weight decay. The default large-convolution path uses cuBLAS; cuDNN convolution and spatial batch normalization are available with `-DDETECTOR_CUDNN=ON`.
 - CUDA detector training can use multiple selected devices via `--gpus 0,1`: one replica per device, balanced shards of the total `--batch`, concurrent local steps, and sample-weighted state synchronization after each global step. The one-GPU path and weighted synchronization math are tested. This laptop has only one GPU, so an actual two-GPU run and its throughput have not been measured.
 - Darknet-format weight load/save, partial backbone initialization, checkpoint step/epoch resume, IDX/MNIST classifier CLI, native detection/evaluation, and Jetson inference. Optional ONNX/TensorRT deployment has been validated for YOLOv3-tiny, YOLOv2/Darknet19, and full YOLOv3/Darknet-53.
+- Semantic segmentation now has a pixelwise softmax-cross-entropy head with a void-label ignore value; instance segmentation uses a separately trained binary ROI mask head on each detector box. VOC2007 semantic/object masks can be packed into fixed-size records. Synthetic training/evaluation, CPU/CUDA mask inference, and one-record real-VOC training smoke checks pass; no full-budget segmentation checkpoint or held-out IoU/AP has been measured.
 
 ## Measured model results
 
@@ -30,5 +31,6 @@ A deeper two-convolution MNIST classifier trained by this framework on the lapto
 - This is the supported subset of Darknet's cfg vocabulary, not an arbitrary upstream cfg interpreter. A same-evaluator external-Darknet YOLOv2 baseline has not been run.
 - Actual multi-GPU execution needs a host with at least two CUDA devices. Each device uses local batch-normalization statistics during its forward/backward pass; running statistics are averaged between devices. The current cross-device state transfer uses host memory, and its throughput is unmeasured.
 - Native training from scratch has not produced a useful VOC detector; the measured native checkpoints above use pretrained backbones.
+- The segmentation example trainers currently use CPU `VectorTrainer` SGD. The instance mask stage is class-agnostic and trained separately from the detector; its `eval` metric is mask IoU on supplied ground-truth crops, not end-to-end instance AP. Mask inference supports native CUDA, but ONNX/TensorRT export and Jetson validation of these new heads have not been done.
 
 See [engineering milestones](engineering-log.md) and [the training design](../DESIGN.yaml) for the implementation and validation history.

@@ -244,11 +244,25 @@ YOLO inference path.
 - A hand-computed channel-window case, central finite-difference input-gradient check, CPU/CUDA
   inference parity, detector minibatch parity, and classifier single-step/sequence parity pass.
 
-**2026-10-28 � `[local]` and `[deconvolutional]` layers.**
+**2026-10-28 — `[local]` and `[deconvolutional]` layers.**
 - Added a locally connected layer (one filter bank per output location) and a transposed-convolution
   layer to CPU/CUDA inference, detector minibatch training, classifier SGD and recurrent classifier chunks.
 - Verified with hand-computed outputs, finite-difference input/weight/bias gradient checks, CPU/CUDA
   inference parity and detector/classifier (single-step and RNN sequence) training parity.
+
+**2026-10-29 — Semantic and instance segmentation examples.**
+- Added pixelwise softmax cross-entropy with `-1` ignored pixels to the CPU vector trainer and
+  a semantic segmentation CLI reporting pixel accuracy and mean class IoU. Added a separate
+  class-agnostic ROI mask trainer and an inference path that crops each detector box, predicts a
+  binary mask, and maps it back to original-image coordinates. The instance CLI reports mask IoU
+  on supplied ground-truth crops and writes one PGM per detected object during prediction.
+- Built VOC2007 manifest/record packers. The 209-image segmentation train split yielded 633
+  object-mask regions; all 209 semantic and 633 instance records packed at 32x32. The example
+  trainers are CPU-only; mask inference is CPU/CUDA. Synthetic CLI convergence, exact loss-gradient
+  and ignore-label checks, CPU/CUDA mask projection and data-packer tests pass. A one-record real
+  VOC training smoke produced finite losses (3.910599 semantic / 0.456147 instance); these are
+  pipeline checks, not model quality. No full VOC training, held-out IoU/AP, or Jetson mask
+  benchmark is claimed.
 
 ## Bugs found and fixed (debugging skills, concrete)
 
@@ -266,9 +280,12 @@ YOLO inference path.
 5. **GPU kernel hotspot** — direct convolution and serial BN reductions, found by profiling
    (Nsight Systems) rather than guessing; fixed with cuBLAS SGEMM + tiled parallel reductions,
    verified numerically equivalent before being trusted on a multi-day run.
-6. **Deep-head training divergence** — the first full YOLOv3/Darknet-53 run reached non-finite
+ 6. **Deep-head training divergence** — the first full YOLOv3/Darknet-53 run reached non-finite
    loss in epoch 2 at LR 0.001 with momentum 0.9. A controlled tenfold LR reduction completed
    the 71-epoch run and yielded the strongest detector checkpoint.
+ 7. **Missing CUDA raw terminal output** — CPU inference exposed the final plain convolution/connected
+    tensor for regressor/tag-style heads, but CUDA inference returned no head. The instance-mask
+    CPU/CUDA projection test exposed it; the CUDA runner now downloads the final raw tensor too.
 
 ## Methodology/skills demonstrated
 

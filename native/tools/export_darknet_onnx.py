@@ -139,6 +139,33 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
             shape = (filters, (h + 2 * padding - size) // stride + 1,
                      (w + 2 * padding - size) // stride + 1)
             previous = name
+        elif kind == "deconvolutional":
+            filters = int(options["filters"])
+            size = int(options["size"])
+            stride = int(options.get("stride", "1"))
+            padding = int(options.get("padding", "0"))
+            if min(filters, size, stride) <= 0 or padding < 0 or int(options.get("batch_normalize", "0")):
+                raise ValueError(f"invalid deconvolution at layer {index}")
+            biases = take(filters)
+            # Weight layout [in_channel][filter][ky][kx] is exactly ONNX ConvTranspose's (C_in, C_out, kH, kW).
+            kernel = take(c * filters * size * size).reshape(c, filters, size, size)
+            weight_name, bias_name = f"{name}_weight", f"{name}_bias"
+            initializers.extend((numpy_helper.from_array(kernel, weight_name),
+                                 numpy_helper.from_array(biases, bias_name)))
+            conv_name = f"{name}_deconv"
+            nodes.append(helper.make_node("ConvTranspose", [previous, weight_name, bias_name],
+                                          [conv_name], name=conv_name,
+                                          pads=[padding] * 4, strides=[stride, stride]))
+            activation = options.get("activation", "linear")
+            if activation == "leaky":
+                nodes.append(helper.make_node("LeakyRelu", [conv_name], [name],
+                                              name=f"{name}_leaky", alpha=0.1))
+            elif activation == "linear":
+                nodes.append(helper.make_node("Identity", [conv_name], [name], name=name))
+            else:
+                raise ValueError(f"unsupported activation {activation} at layer {index}")
+            shape = (filters, stride * (h - 1) + size - 2 * padding, stride * (w - 1) + size - 2 * padding)
+            previous = name
         elif kind == "maxpool":
             size, stride = int(options["size"]), int(options["stride"])
             if min(size, stride) <= 0:
@@ -247,9 +274,15 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
             raise ValueError(f"invalid output shape at layer {index}")
         tensors.append(previous)
         shapes.append(shape)
+    segmentation = head_count == 0 and sections[-1][0] in ("convolutional", "deconvolutional")
+    if segmentation:
+        # Dense-prediction cfg (semantic logits / binary mask logits): the last layer is the output.
+        nodes.append(helper.make_node("Identity", [previous], ["logits"], name="segmentation_logits"))
+        outputs.append(helper.make_tensor_value_info("logits", TensorProto.FLOAT, [1, *shape]))
+        head_count = 1
     if head_count < 1 or cursor != floats.size:
-        raise ValueError(f"expected at least one complete YOLO/region head; got {head_count}, "
-                         f"unused floats={floats.size - cursor}")
+        raise ValueError(f"expected at least one complete YOLO/region head or a convolutional segmentation "
+                         f"output; got {head_count}, unused floats={floats.size - cursor}")
     graph = helper.make_graph(nodes, "darknet_detector_raw_heads",
                               [helper.make_tensor_value_info(
                                   "images", TensorProto.FLOAT, [1, channels, height, width])],
@@ -260,7 +293,8 @@ def export(cfg: Path, weights: Path, output: Path) -> dict[str, object]:
     metadata = {"darknet_cfg_sha256": sha256(cfg),
                 "darknet_weights_sha256": sha256(weights),
                 "darknet_images_seen": str(seen),
-                "output_semantics": "raw NCHW YOLO/region head logits; decode and NMS external"}
+                "output_semantics": "raw NCHW per-pixel logits (softmax/sigmoid external)" if segmentation else
+                    "raw NCHW YOLO/region head logits; decode and NMS external"}
     for key, value in metadata.items():
         item = model.metadata_props.add()
         item.key, item.value = key, value

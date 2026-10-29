@@ -236,6 +236,50 @@ anchors=1,1
             self.assertEqual([list(head.shape) for head in heads], result["heads"])
             self.assertTrue(np.isfinite(heads[0]).all())
 
+    def test_segmentation_deconvolution_head(self):
+        """A head-less conv/maxpool/deconv cfg exports raw per-pixel logits matching a numpy
+        transposed-convolution scatter reference (same math as deconvolutional_forward)."""
+        cfg_text = """[net]
+channels=1
+height=4
+width=4
+[maxpool]
+size=2
+stride=2
+[deconvolutional]
+filters=3
+size=3
+stride=2
+padding=1
+activation=leaky
+"""
+        rng = np.random.default_rng(3)
+        biases = rng.normal(size=3).astype("<f4")
+        kernel = rng.normal(size=(1, 3, 3, 3)).astype("<f4")
+        image = rng.normal(size=(1, 1, 4, 4)).astype("<f4")
+        pooled = image.reshape(1, 1, 2, 2, 2, 2).max(axis=(3, 5))[0, 0]
+        out = 2 * (2 - 1) + 3 - 2
+        expected = np.tile(biases[:, None, None], (1, out, out)).astype(np.float32)
+        for iy in range(2):
+            for ix in range(2):
+                for oc in range(3):
+                    for ky in range(3):
+                        for kx in range(3):
+                            oy, ox = iy * 2 + ky - 1, ix * 2 + kx - 1
+                            if 0 <= oy < out and 0 <= ox < out:
+                                expected[oc, oy, ox] += pooled[iy, ix] * kernel[0, oc, ky, kx]
+        expected = np.where(expected < 0, expected * 0.1, expected)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cfg, weights, model = (root / name for name in ("seg.cfg", "seg.weights", "seg.onnx"))
+            cfg.write_text(cfg_text, encoding="utf-8")
+            weights.write_bytes(struct.pack("<iiiQ", 0, 2, 0, 1) + biases.tobytes() + kernel.tobytes())
+            result = export(cfg, weights, model)
+            self.assertEqual(result["heads"], [[1, 3, out, out]])
+            session = ort.InferenceSession(str(model), providers=["CPUExecutionProvider"])
+            logits = session.run(["logits"], {"images": image})[0]
+            np.testing.assert_allclose(logits[0], expected, rtol=1e-5, atol=1e-5)
+
 
 if __name__ == "__main__":
     unittest.main()
